@@ -273,6 +273,7 @@ class MakeMoveRequest(BaseModel):
     """Request to make a move."""
     agent_id: str
     move: str  # Format: "row,col" or "<move>row,col</move>"
+    wait_for_opponent: bool = False  # If True, block until opponent moves
 
 
 class MakeMoveResponse(BaseModel):
@@ -283,6 +284,9 @@ class MakeMoveResponse(BaseModel):
     done: bool
     info: Dict[str, Any]
     error: Optional[str] = None
+    # Fields for wait_for_opponent=True mode
+    next_observation: Optional[str] = None  # Board state after opponent moved
+    opponent_move: Optional[Dict[str, Any]] = None  # Opponent's move details
 
 
 class WaitForOpponentResponse(BaseModel):
@@ -488,14 +492,55 @@ class MultiAgentGameServer:
                 
                 logger.info(f"[{session_id}] {agent_role.value} moved to ({row}, {col})")
                 
-                return MakeMoveResponse(
-                    valid=result["valid"],
-                    observation=result["observation"],
-                    reward=result["reward"],
-                    done=result["done"],
-                    info=result["info"],
-                    error=result.get("error"),
-                )
+                # If game ended or wait_for_opponent=False, return immediately
+                if result["done"] or not request.wait_for_opponent:
+                    return MakeMoveResponse(
+                        valid=result["valid"],
+                        observation=result["observation"],
+                        reward=result["reward"],
+                        done=result["done"],
+                        info=result["info"],
+                        error=result.get("error"),
+                    )
+            
+            # wait_for_opponent=True: Wait for opponent's move outside the lock
+            # This allows the opponent to acquire the lock and make their move
+            timeout = 300  # Use a reasonable timeout for opponent's move
+            start_time = time.time()
+            
+            while session.current_turn == agent_role or session.status != GameStatus.IN_PROGRESS:
+                # If game already ended, break
+                if session.status != GameStatus.IN_PROGRESS:
+                    break
+                # If it's no longer our turn, opponent has moved
+                if session.current_turn != agent_role:
+                    break
+                    
+                try:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    
+                    # Wait for move event
+                    await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 1.0))
+                    session.move_event.clear()
+                except asyncio.TimeoutError:
+                    if time.time() - start_time >= timeout:
+                        raise HTTPException(408, "Timeout waiting for opponent's move")
+                    continue
+            
+            # Return the updated state after opponent moved
+            opponent_last_move = session.move_history[-1] if session.move_history else None
+            return MakeMoveResponse(
+                valid=result["valid"],
+                observation=result["observation"],
+                reward=result["reward"],
+                done=session.status != GameStatus.IN_PROGRESS,
+                info=result["info"] if session.status == GameStatus.IN_PROGRESS else {"result": session.status.value},
+                error=result.get("error"),
+                next_observation=session.render_board(),
+                opponent_move=opponent_last_move,
+            )
         
         @self.app.get("/session/{session_id}/wait_for_opponent", response_model=WaitForOpponentResponse)
         async def wait_for_opponent(session_id: str, agent_id: str, timeout: float = 300):

@@ -795,6 +795,16 @@ class ServiceClient:
                     global_steps = result["global_steps"]
                     last_metrics = result["metrics"]
 
+                    # Multi-agent sync: barrier AFTER train_step to ensure both agents
+                    # finish current step before either proceeds to next step.
+                    # This prevents step count divergence when games end on WHITE's turn.
+                    if phase_client:
+                        try:
+                            phase_client.sync_barrier(f"step_complete_{steps_completed}")
+                            logger.debug(f"Step {steps_completed} completion synced")
+                        except Exception as e:
+                            logger.warning(f"Failed to sync step completion at step {steps_completed}: {e}")
+
                     # Fetch and log game stats (if game_stats_client provided)
                     if game_stats_client and global_steps % game_stats_log_freq == 0:
                         try:

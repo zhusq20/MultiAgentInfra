@@ -249,10 +249,12 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         # Extract move from LLM's last message
         last_message = messages[-1]["content"] if messages else ""
         
-        # Submit move to game server
+        # Submit move to game server with wait_for_opponent=True
+        # This blocks until opponent moves, combining move+wait into atomic operation
         move_result = await self._make_request("POST", f"session/{session_id}/move", json_data={
             "agent_id": agent_id,
             "move": last_message,
+            "wait_for_opponent": True,  # Block until opponent moves
         })
         
         if not move_result["valid"]:
@@ -271,49 +273,45 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         if move_result["done"]:
             # Game ended (win, loss, or draw)
             result = move_result["info"].get("result", "unknown")
-            logger.info(f"[{request_id}] Game ended after our move. Result: {result}, Session: {session_id}")
+            
+            # Check if we won or lost based on result
+            if "win" in result.lower():
+                # Game ended with a winner
+                if agent_role.lower() in result.lower():
+                    # We won
+                    reward = move_result["reward"]
+                else:
+                    # Opponent won (we lost)
+                    reward = -1.0
+            else:
+                # Draw or other terminal state
+                reward = move_result["reward"]
+            
+            # Use next_observation if available, otherwise use observation
+            final_observation = move_result.get("next_observation") or move_result["observation"]
+            logger.info(f"[{request_id}] Game ended. Result: {result}, Session: {session_id}")
             return (
                 True,
-                f"Game Over - {result.upper()}\n{move_result['observation']}",
-                move_result["reward"],
+                f"Game Over - {result.upper()}\n{final_observation}",
+                reward,
                 move_result["info"],
             )
         
-        # Wait for opponent's move
-        logger.debug(f"[{request_id}] Waiting for opponent's move...")
-        wait_result = await self._make_request(
-            "GET",
-            f"session/{session_id}/wait_for_opponent",
-            params={"agent_id": agent_id, "timeout": self.timeout},
-            timeout=self.timeout + 5,
-        )
+        # Game continues - opponent has moved (already waited via wait_for_opponent=True)
+        opponent_move = move_result.get("opponent_move", {})
+        next_observation = move_result.get("next_observation", move_result["observation"])
         
-        if wait_result["done"]:
-            # Game ended during opponent's turn
-            result = wait_result["info"].get("result", "unknown")
-            # Opponent won means we lost
-            reward = -1.0 if "win" in result and agent_role not in result else 0.0
-            logger.info(f"[{request_id}] Game ended (opponent's turn): {result}")
-            return (
-                True,
-                f"Game Over - {result.upper()}\n{wait_result['observation']}",
-                reward,
-                wait_result["info"],
-            )
-        
-        # Game continues - return updated board
-        last_move = wait_result.get("last_move", {})
-        opponent_pos = last_move.get("position", ["?", "?"])
+        opponent_pos = opponent_move.get("position", ["?", "?"])
         observation = (
             f"Opponent moved to ({opponent_pos[0]}, {opponent_pos[1]}). Your turn.\n"
-            f"{wait_result['observation']}"
+            f"{next_observation}"
         )
         
         return (
             False,  # should_terminate
             observation,
             0.0,  # intermediate reward
-            {"last_opponent_move": last_move},
+            {"last_opponent_move": opponent_move},
         )
 
     async def finalize_interaction(self) -> None:
