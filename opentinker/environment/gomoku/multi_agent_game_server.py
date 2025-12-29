@@ -327,7 +327,11 @@ class MultiAgentGameServer:
         async def create_session(request: CreateSessionRequest):
             """Create a new game session."""
             if request.session_id in self.sessions:
-                raise HTTPException(400, f"Session {request.session_id} already exists")
+                return CreateSessionResponse(
+                    session_id=request.session_id,
+                    status="exists",
+                    message=f"Session {request.session_id} already exists",
+                )
             
             session = GameSession(
                 session_id=request.session_id,

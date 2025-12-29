@@ -156,17 +156,17 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         if game_session_id:
             # Use the deterministic session ID directly
             session_id = game_session_id
-            logger.info(f"[{request_id[:8]}] Using deterministic session_id: {session_id}")
+            logger.info(f"[{request_id}] Using deterministic session_id: {session_id}")
         else:
             # Fallback: generate from request_id (for single-agent or testing)
             base_session_id = kwargs.get("session_id", self.session_id)
             if not base_session_id or base_session_id == "default_session":
                 base_session_id = "game"
-            session_id = f"{base_session_id}_{request_id[:8]}"
-            logger.info(f"[{request_id[:8]}] Generated session_id from request_id: {session_id}")
+            session_id = f"{base_session_id}_{request_id}"
+            logger.info(f"[{request_id}] Generated session_id from request_id: {session_id}")
         
         agent_role = kwargs.get("agent_role", self.agent_role)
-        agent_id = f"agent_{agent_role}_{session_id[-8:]}"
+        agent_id = f"agent_{agent_role}_{session_id}"
         
         # Try to create session first (will fail if exists, which is OK)
         try:
@@ -177,9 +177,8 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             })
             logger.info(f"[{request_id}] Created session {session_id}")
         except httpx.HTTPStatusError as e:
-            if e.response.status_code != 400:  # 400 = session exists, which is fine
-                raise
-            logger.debug(f"[{request_id}] Session {session_id} already exists")
+            logger.error(f"[{request_id}] Failed to create session {session_id}: {e}")
+            raise
         
         # Join the session
         join_result = await self._make_request("POST", f"session/{session_id}/join", json_data={
