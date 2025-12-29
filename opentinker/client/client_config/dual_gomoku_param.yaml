@@ -1,0 +1,86 @@
+# Dual Agent Gomoku Training Configuration
+# Two LLM agents play against each other
+
+# Experiment identification
+experiment_name: dual_agent_gomoku
+project_name: opentinker
+
+# Logging
+logger_backends: ["console", "wandb"]
+
+# Agent configuration (can be overridden via CLI or environment)
+# AGENT_ROLE env var or agent_role config determines BLACK or WHITE
+agent_role: BLACK
+session_id: default_session
+
+# Multi-agent services
+game_server_url: http://localhost:8790
+coordinator_url: http://localhost:8791
+
+# Synchronization timeout (seconds)
+sync_timeout: 3000
+
+# Model and tokenizer
+tokenizer_path: Qwen/Qwen2.5-3B-Instruct
+
+# Training parameters
+batch_size: 4
+num_workers: 4
+num_epochs: null
+num_steps: 1000
+save_freq: 100
+test_freq: 50
+
+# Validation parameters
+val_batch_size: 50
+
+# Generation parameters
+temperature: 0.8
+top_p: 0.95
+max_new_tokens: 5120
+max_prompt_tokens: 2048
+
+# Algorithm
+algorithm: "agent_loop"
+adv_estimator: "grpo"
+rollout_n: 4
+
+# Interaction configuration
+interaction:
+  name: multi_agent_gomoku
+  class_path: opentinker.environment.gomoku.multi_agent_gomoku_interaction.MultiAgentGomokuInteraction
+  config:
+    env_host: 0.0.0.0
+    env_port: 8790
+    env_endpoint: http://${interaction.config.env_host}:${interaction.config.env_port}
+    board_size: 9
+    max_total_steps: 40
+    max_steps: 81
+    max_initial_moves: 0
+    observation_template: "{observation}"
+    empty_board_prob: 1.0
+    # Multi-agent specific (will be overwritten by client)
+    interaction_config_path: null
+    agent_role: ${agent_role}
+    session_id: ${session_id}
+    game_server_url: ${game_server_url}
+
+multi_turn:
+  max_user_turns: 40
+  max_assistant_turns: 40
+  max_tokens_per_turn: 128
+
+# Scheduler settings
+scheduler_url: "http://0.0.0.0:8780"
+scheduler_api_key: null
+
+# GPU settings
+num_gpus: 2
+
+# Tracing (optional)
+enable_tracing: false
+weave_project: dual-gomoku-training
+
+# WandB (optional)
+wandb_key: null
+

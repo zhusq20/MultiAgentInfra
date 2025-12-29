@@ -358,12 +358,32 @@ class GenericAgentLoop(AgentLoopBase):
                 raise ValueError(
                     f"Interaction '{interaction_name}' not found. Available: {list(self.interaction_map.keys())}"
                 )
+            
+            # Generate deterministic game_session_id for multi-agent interactions
+            # This ensures BLACK and WHITE agents join the same game session
+            # The ID is based on step, sample_index, and rollout_n which are the same
+            # for both agents processing the same game
+            if interaction_name in ("multi_agent_gomoku", "gomoku"):
+                # Extract trajectory info from kwargs
+                _step = kwargs.get("step", 0)
+                _sample_index = kwargs.get("index", kwargs.get("sample_index", 0))
+                _rollout_n = kwargs.get("rollout_n", 0)
+                _validate = kwargs.get("validate", False)
+                
+                # Create a deterministic session ID that will be the same for both BLACK and WHITE
+                # Format: {mode}_s{step}_i{sample_index}_r{rollout_n}
+                # Use different prefix for validation to avoid conflicts with training sessions
+                mode_prefix = "val" if _validate else "train"
+                game_session_id = f"{mode_prefix}_s{_step}_i{_sample_index}_r{_rollout_n}"
+                interaction_kwargs["game_session_id"] = game_session_id
+                print(f"[GenericAgentLoop] Generated deterministic game_session_id: {game_session_id}")
+            
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(request_id, **interaction_kwargs)
 
             # Capture initial board state ONLY for Gomoku environment (not other environments)
             initial_board_state = None
-            if interaction_name == "gomoku":  # Only for Gomoku
+            if interaction_name in ("multi_agent_gomoku", "gomoku"):
                 if (
                     hasattr(interaction, "_instance_dict")
                     and request_id in interaction._instance_dict
