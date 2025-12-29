@@ -33,7 +33,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import httpx
 
 from verl.interactions.base import BaseInteraction
 
@@ -98,14 +98,14 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         # Instance data: request_id -> instance state
         self._instance_dict: Dict[str, Dict[str, Any]] = {}
         
-        self.session = requests.Session()
+        self.client = httpx.AsyncClient(timeout=self.timeout)
         
         logger.info(
             f"MultiAgentGomokuInteraction initialized: role={self.agent_role}, "
             f"server={self.game_server_url}, session={self.session_id}"
         )
     
-    def _make_request(
+    async def _make_request(
         self,
         method: str,
         endpoint: str,
@@ -116,21 +116,21 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         """Make HTTP request to the game server."""
         url = f"{self.game_server_url}/{endpoint}"
         timeout = timeout or self.timeout
-        
+
         try:
             if method.upper() == "GET":
-                response = self.session.get(url, params=params, timeout=timeout)
+                response = await self.client.get(url, params=params, timeout=timeout)
             elif method.upper() == "POST":
-                response = self.session.post(url, json=json_data, params=params, timeout=timeout)
+                response = await self.client.post(url, json=json_data, params=params, timeout=timeout)
             elif method.upper() == "DELETE":
-                response = self.session.delete(url, timeout=timeout)
+                response = await self.client.delete(url, timeout=timeout)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-            
+
             response.raise_for_status()
             return response.json()
-            
-        except requests.exceptions.RequestException as e:
+
+        except httpx.HTTPError as e:
             logger.error(f"Request to {endpoint} failed: {e}")
             raise
     
@@ -170,19 +170,19 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         
         # Try to create session first (will fail if exists, which is OK)
         try:
-            self._make_request("POST", "session/create", json_data={
+            await self._make_request("POST", "session/create", json_data={
                 "session_id": session_id,
                 "board_size": self.board_size,
                 "max_total_steps": self.max_total_steps,
             })
             logger.info(f"[{request_id}] Created session {session_id}")
-        except requests.exceptions.HTTPError as e:
+        except httpx.HTTPStatusError as e:
             if e.response.status_code != 400:  # 400 = session exists, which is fine
                 raise
             logger.debug(f"[{request_id}] Session {session_id} already exists")
         
         # Join the session
-        join_result = self._make_request("POST", f"session/{session_id}/join", json_data={
+        join_result = await self._make_request("POST", f"session/{session_id}/join", json_data={
             "agent_id": agent_id,
             "role": agent_role,
         })
@@ -195,13 +195,13 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         # Wait for game to start (opponent to join)
         if join_result["status"] != "in_progress":
             logger.info(f"[{request_id}] Waiting for opponent to join...")
-            start_result = self._make_request(
+            start_result = await self._make_request(
                 "POST",
                 f"session/{session_id}/wait_for_start",
                 params={"agent_id": agent_id, "timeout": self.timeout},
                 timeout=self.timeout + 5,
             )
-            logger.info(f"[{request_id}] Game started! Role: {start_result['your_role']}")
+            logger.info(f"[{request_id}] Game started! Session: {session_id}, Role: {start_result['your_role']}")
         
         # Store session mapping
         self._sessions[request_id] = session_id
@@ -215,7 +215,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         # If WHITE, wait for BLACK's first move
         if agent_role == "WHITE":
             logger.info(f"[{request_id}] WHITE waiting for BLACK's first move...")
-            wait_result = self._make_request(
+            wait_result = await self._make_request(
                 "GET",
                 f"session/{session_id}/wait_for_opponent",
                 params={"agent_id": agent_id, "timeout": self.timeout},
@@ -251,7 +251,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         last_message = messages[-1]["content"] if messages else ""
         
         # Submit move to game server
-        move_result = self._make_request("POST", f"session/{session_id}/move", json_data={
+        move_result = await self._make_request("POST", f"session/{session_id}/move", json_data={
             "agent_id": agent_id,
             "move": last_message,
         })
@@ -272,7 +272,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         if move_result["done"]:
             # Game ended (win, loss, or draw)
             result = move_result["info"].get("result", "unknown")
-            logger.info(f"[{request_id}] Game ended: {result}")
+            logger.info(f"[{request_id}] Game ended after our move. Result: {result}, Session: {session_id}")
             return (
                 True,
                 f"Game Over - {result.upper()}\n{move_result['observation']}",
@@ -282,7 +282,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         
         # Wait for opponent's move
         logger.debug(f"[{request_id}] Waiting for opponent's move...")
-        wait_result = self._make_request(
+        wait_result = await self._make_request(
             "GET",
             f"session/{session_id}/wait_for_opponent",
             params={"agent_id": agent_id, "timeout": self.timeout},
@@ -316,6 +316,11 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             0.0,  # intermediate reward
             {"last_opponent_move": last_move},
         )
+
+    async def finalize_interaction(self) -> None:
+        """Close the HTTP client."""
+        await self.client.aclose()
+        logger.info(f"MultiAgentGomokuInteraction finalized for session {self.session_id}")
     
     def get_system_prompt(self) -> str:
         """Return the system prompt for multi-agent Gomoku."""

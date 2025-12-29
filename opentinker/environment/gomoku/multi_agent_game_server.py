@@ -135,10 +135,11 @@ class GameSession:
         symbol = "X" if agent_role == PlayerRole.BLACK else "O"
         
         # Validate move
-        if not (0 <= row < self.board_size and 0 <= col < self.board_size):
+        if row < 0 or row >= self.board_size or col < 0 or col >= self.board_size:
+            self.status = GameStatus.DRAW  # Terminate game on invalid move
             return {
                 "valid": False,
-                "error": f"Invalid position ({row}, {col}). Must be within [0, {self.board_size-1}].",
+                "error": f"Move ({row}, {col}) is out of bounds.",
                 "observation": self.render_board(),
                 "reward": -1.0,
                 "done": True,
@@ -146,6 +147,7 @@ class GameSession:
             }
         
         if self.board[row][col] != ".":
+            self.status = GameStatus.DRAW  # Terminate game on invalid move
             return {
                 "valid": False,
                 "error": f"Position ({row}, {col}) is already occupied.",
@@ -532,9 +534,13 @@ class MultiAgentGameServer:
                     if remaining <= 0:
                         raise asyncio.TimeoutError()
                     
-                    # Clear and wait for new event
-                    session.move_event.clear()
+                    # Wait for move event or timeout
+                    # We don't clear the event here to avoid race conditions
+                    # Instead, make_move will set it, and we check state in the loop
                     await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 1.0))
+                    
+                    # Clear it after we've woken up so the next waiter can wait
+                    session.move_event.clear()
                 except asyncio.TimeoutError:
                     if time.time() - start_time >= timeout:
                         raise HTTPException(408, "Timeout waiting for opponent")

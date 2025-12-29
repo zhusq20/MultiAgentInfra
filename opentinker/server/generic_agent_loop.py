@@ -412,10 +412,13 @@ class GenericAgentLoop(AgentLoopBase):
         state = GenericAgentState.PENDING
         while state != GenericAgentState.TERMINATED:
             if state == GenericAgentState.PENDING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: PENDING")
                 state = await self._handle_pending_state(agent_data, sampling_params)
             elif state == GenericAgentState.GENERATING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: GENERATING (Calling LLM)")
                 state = await self._handle_generating_state(agent_data, sampling_params)
             elif state == GenericAgentState.INTERACTING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: INTERACTING (Calling Environment)")
                 state = await self._handle_interacting_state(agent_data)
             else:
                 logger.error(f"Invalid state: {state}")
