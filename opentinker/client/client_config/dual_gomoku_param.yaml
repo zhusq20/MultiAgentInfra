@@ -43,7 +43,7 @@ max_prompt_tokens: 2048
 # Algorithm
 algorithm: "agent_loop"
 adv_estimator: "grpo"
-rollout_n: 4
+rollout_n: 8
 
 # Interaction configuration
 interaction:

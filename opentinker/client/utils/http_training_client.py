@@ -612,6 +612,12 @@ class ServiceClient:
                     },
                     "rollout": {
                         "tensor_model_parallel_size": 2 if args.num_gpus > 1 else 1,
+                        # Pass rollout_n for GRPO (number of responses per sample)
+                        "n": args.get("rollout_n", 1),
+                        # Pass agent.num_workers to match batch size
+                        "agent": {
+                            "num_workers": args.get("num_workers", 8),
+                        },
                     },
                 },
                 "critic": {
@@ -661,6 +667,7 @@ class ServiceClient:
         verbose: bool = True,
         game_stats_client=None,
         game_stats_log_freq: int = 1,
+        phase_client=None,
     ):
         """
         Train the model.
@@ -677,6 +684,9 @@ class ServiceClient:
             game_stats_client: Optional GameStatsClient for fetching per-step game metrics
             game_stats_log_freq: How often to log game stats (in steps), only used if
                                 game_stats_client is provided
+            phase_client: Optional PhaseCoordinatorClient for multi-agent step sync.
+                         When provided, a barrier sync is performed before each train_step
+                         to ensure all agents start at the same step.
 
         Note:
             - If both num_steps and num_epochs are provided, num_steps takes precedence
@@ -729,6 +739,13 @@ class ServiceClient:
 
         # 4. Run validation before training if requested
         if validate_before_training and val_dataloader:
+            # Multi-agent sync: barrier before pre-training validation
+            if phase_client:
+                try:
+                    phase_client.sync_barrier("pre_training_validation")
+                except Exception as e:
+                    logger.warning(f"Failed to sync for pre-training validation: {e}")
+            
             logger.info("Running validation before training...")
             val_metrics = self._run_validation(val_dataloader, game_stats_client)
             logger.info(f"Pre-training validation: {val_metrics}")
@@ -748,6 +765,15 @@ class ServiceClient:
                     logger.info(f"Starting epoch {epoch + 1}/{effective_epochs}")
 
                 for batch_dict in train_dataloader:
+                    # Multi-agent sync: barrier before train_step to ensure both agents
+                    # start at the same step (critical for game_session_id matching)
+                    if phase_client:
+                        try:
+                            phase_client.sync_barrier(f"rollout_step_{steps_completed}")
+                            logger.debug(f"Synced at step {steps_completed}")
+                        except Exception as e:
+                            logger.warning(f"Failed to sync at step {steps_completed}: {e}")
+
                     # Reset game stats before each step (if game_stats_client provided)
                     if game_stats_client:
                         try:
@@ -828,6 +854,14 @@ class ServiceClient:
                         and test_freq > 0
                         and global_steps % test_freq == 0
                     ):
+                        # Multi-agent sync: barrier before validation to ensure both
+                        # agents start validation at the same step
+                        if phase_client:
+                            try:
+                                phase_client.sync_barrier(f"validation_step_{global_steps}")
+                            except Exception as e:
+                                logger.warning(f"Failed to sync for validation at step {global_steps}: {e}")
+                        
                         val_metrics = self._run_validation(
                             val_dataloader, game_stats_client
                         )

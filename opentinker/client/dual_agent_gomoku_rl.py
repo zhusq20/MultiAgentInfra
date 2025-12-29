@@ -352,6 +352,7 @@ def main(args):
             verbose=True,
             validate_before_training=True,
             game_stats_client=game_stats,
+            phase_client=phase_client,  # Enable step-level sync
         )
         
         print("\n" + "=" * 60)

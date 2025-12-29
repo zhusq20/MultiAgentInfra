@@ -361,17 +361,19 @@ class GenericAgentLoop(AgentLoopBase):
             
             # Generate deterministic game_session_id for multi-agent interactions
             # This ensures BLACK and WHITE agents join the same game session
-            # The ID is based on step, sample_index, and rollout_n which are the same
-            # for both agents processing the same game
             if interaction_name in ("multi_agent_gomoku", "gomoku"):
                 # Extract trajectory info from kwargs
                 _step = kwargs.get("step", 0)
-                _sample_index = kwargs.get("index", kwargs.get("sample_index", 0))
+                # Use sample_index to compute the correct batch position
+                # sample_index is the dataloader index, synchronized between BLACK and WHITE agents
+                # For GRPO: sample_index identifies the original sample across all rollouts
+                _sample_index = kwargs.get("sample_index", 0)
                 _rollout_n = kwargs.get("rollout_n", 0)
                 _validate = kwargs.get("validate", False)
                 
                 # Create a deterministic session ID that will be the same for both BLACK and WHITE
                 # Format: {mode}_s{step}_i{sample_index}_r{rollout_n}
+                # Using sample_index directly ensures unique games per original sample
                 # Use different prefix for validation to avoid conflicts with training sessions
                 mode_prefix = "val" if _validate else "train"
                 game_session_id = f"{mode_prefix}_s{_step}_i{_sample_index}_r{_rollout_n}"

@@ -33,7 +33,6 @@ import os
 import time
 import threading
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Dict, Optional, Set
 
 import uvicorn
@@ -44,12 +43,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-class Phase(str, Enum):
-    """Training phases."""
-    IDLE = "idle"
-    INITIALIZATION = "initialization"
-    ROLLOUT = "rollout"
-    TRAINING = "training"
+# Phase is now a plain string to support dynamic phase names like "rollout_step_1"
+# Previously was an enum with fixed values (idle, initialization, rollout, training)
+# This change enables step-level barrier synchronization for multi-agent training
 
 
 @dataclass
@@ -61,8 +57,8 @@ class SessionState:
     # Registered agents
     registered_agents: Set[str] = field(default_factory=set)
     
-    # Phase tracking
-    current_phase: Phase = Phase.IDLE
+    # Phase tracking - now uses string instead of enum for dynamic phase names
+    current_phase: str = "idle"
     agents_entered: Set[str] = field(default_factory=set)
     agents_completed: Set[str] = field(default_factory=set)
     
@@ -218,7 +214,7 @@ class PhaseCoordinator:
                 raise HTTPException(404, f"Session {session_id} not found")
             
             session = self.sessions[session_id]
-            phase = Phase(request.phase)
+            phase = request.phase  # Use string directly instead of enum
             
             async with session.lock:
                 # Check if agent is registered
@@ -245,13 +241,13 @@ class PhaseCoordinator:
                     session.all_entered_event.set()
                 
                 logger.info(
-                    f"[{session_id}] Agent {request.agent_id} entered {phase.value}. "
+                    f"[{session_id}] Agent {request.agent_id} entered {phase}. "
                     f"({len(session.agents_entered)}/{session.expected_agents})"
                 )
                 
                 return EnterPhaseResponse(
                     session_id=session_id,
-                    phase=phase.value,
+                    phase=phase,
                     agents_entered=len(session.agents_entered),
                     expected_agents=session.expected_agents,
                     all_entered=all_entered,
@@ -268,7 +264,7 @@ class PhaseCoordinator:
                 raise HTTPException(404, f"Session {session_id} not found")
             
             session = self.sessions[session_id]
-            target_phase = Phase(phase)
+            target_phase = phase  # Use string directly
             
             # Fast path: already all entered
             if (
@@ -311,14 +307,14 @@ class PhaseCoordinator:
                 raise HTTPException(404, f"Session {session_id} not found")
             
             session = self.sessions[session_id]
-            phase = Phase(request.phase)
+            phase = request.phase  # Use string directly instead of enum
             
             async with session.lock:
                 # Validate phase
                 if session.current_phase != phase:
                     raise HTTPException(
                         400,
-                        f"Cannot complete {phase.value}. Current phase: {session.current_phase.value}",
+                        f"Cannot complete {phase}. Current phase: {session.current_phase}",
                     )
                 
                 # Mark agent as completed
@@ -330,13 +326,13 @@ class PhaseCoordinator:
                     session.all_completed_event.set()
                 
                 logger.info(
-                    f"[{session_id}] Agent {request.agent_id} completed {phase.value}. "
+                    f"[{session_id}] Agent {request.agent_id} completed {phase}. "
                     f"({len(session.agents_completed)}/{session.expected_agents})"
                 )
                 
                 return CompletePhaseResponse(
                     session_id=session_id,
-                    phase=phase.value,
+                    phase=phase,
                     agents_completed=len(session.agents_completed),
                     expected_agents=session.expected_agents,
                     all_completed=all_completed,
@@ -394,7 +390,7 @@ class PhaseCoordinator:
                 session_id=session_id,
                 expected_agents=session.expected_agents,
                 registered_agents=list(session.registered_agents),
-                current_phase=session.current_phase.value,
+                current_phase=session.current_phase,
                 current_step=session.current_step,
                 agents_entered=list(session.agents_entered),
                 agents_completed=list(session.agents_completed),
@@ -416,7 +412,7 @@ class PhaseCoordinator:
             
             session = self.sessions[session_id]
             async with session.lock:
-                session.current_phase = Phase.IDLE
+                session.current_phase = "idle"
                 session.current_step = 0
                 session.agents_entered.clear()
                 session.agents_completed.clear()
