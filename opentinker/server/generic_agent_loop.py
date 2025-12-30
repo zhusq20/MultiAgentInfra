@@ -444,8 +444,9 @@ class GenericAgentLoop(AgentLoopBase):
                 # This flag is set by the interaction when game terminates normally
                 game_ended = instance.get("game_ended", False)
                 
-                # Get termination reason for detailed logging
-                termination_reason = agent_data.extra_fields.get("termination_reason", "unknown")
+                # Get termination reason for detailed logging (stored locally, not in extra_fields
+                # to avoid DataProto.concat key mismatch when some games end normally)
+                termination_reason = getattr(agent_data, '_termination_reason', 'unknown')
                 
                 if not game_ended and session_id and agent_id:
                     logger.warning(
@@ -627,15 +628,15 @@ class GenericAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += response_log_probs
 
         # Check termination conditions with detailed logging
-        termination_reason = None
+        # NOTE: Store termination_reason as instance attribute (not in extra_fields)
+        # to avoid DataProto.concat key mismatch when some games end normally
         if len(agent_data.response_mask) >= self.response_length:
-            termination_reason = "response_length_limit"
+            agent_data._termination_reason = "response_length_limit"
             logger.warning(
-                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
                 f"response_tokens={len(agent_data.response_mask)}, limit={self.response_length}, "
                 f"user_turns={agent_data.user_turns}, assistant_turns={agent_data.assistant_turns}"
             )
-            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
         
         # Use > instead of >= so that max_assistant_turns=1 allows 1 generation + 1 step
@@ -644,24 +645,22 @@ class GenericAgentLoop(AgentLoopBase):
             self.max_assistant_turns
             and agent_data.assistant_turns > self.max_assistant_turns
         ):
-            termination_reason = "max_assistant_turns_exceeded"
+            agent_data._termination_reason = "max_assistant_turns_exceeded"
             logger.warning(
-                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
                 f"assistant_turns={agent_data.assistant_turns}, limit={self.max_assistant_turns}, "
                 f"user_turns={agent_data.user_turns}, response_tokens={len(agent_data.response_mask)}"
             )
-            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
         
         # Similarly, max_user_turns=1 means user can ask once, then terminate after next generation
         if self.max_user_turns and agent_data.user_turns > self.max_user_turns:
-            termination_reason = "max_user_turns_exceeded"
+            agent_data._termination_reason = "max_user_turns_exceeded"
             logger.warning(
-                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
                 f"user_turns={agent_data.user_turns}, limit={self.max_user_turns}, "
                 f"assistant_turns={agent_data.assistant_turns}, response_tokens={len(agent_data.response_mask)}"
             )
-            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
 
         # Add assistant message to conversation history
