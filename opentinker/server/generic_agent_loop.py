@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
+from opentinker.backend_patch.verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import (
     initialize_interactions_from_config,
@@ -477,6 +477,9 @@ class GenericAgentLoop(AgentLoopBase):
         # Return 0.0 if no turn scores collected - this prevents fallback to naive reward loop
         # which expects ground_truth data that gym environments don't provide
         final_reward = sum(agent_data.turn_scores) if agent_data.turn_scores else 0.0
+        
+        # DEBUG: Log turn_scores and final_reward for diagnosis
+        print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] REWARD: turn_scores={agent_data.turn_scores}, final_reward={final_reward}, user_turns={agent_data.user_turns}")
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,

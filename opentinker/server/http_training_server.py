@@ -1499,9 +1499,19 @@ class PPOTrainingServerBackend:
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
 
+            # DEBUG: Log if rm_scores is in batch before calling val_reward_fn
+            has_rm_scores = "rm_scores" in batch.batch.keys()
+            print(f"[validate_step DEBUG] Before val_reward_fn: batch has rm_scores={has_rm_scores}")
+            if has_rm_scores:
+                rm_scores_in_batch = batch.batch["rm_scores"].sum(-1).cpu().tolist()
+                print(f"[validate_step DEBUG] rm_scores from batch: {rm_scores_in_batch[:10]}... max={max(rm_scores_in_batch)}, min={min(rm_scores_in_batch)}")
+            
             result = self.val_reward_fn(batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
+            
+            # DEBUG: Log scores after val_reward_fn
+            print(f"[validate_step DEBUG] After val_reward_fn: scores={scores[:10]}... max={max(scores)}, min={min(scores)}")
 
             # 5. Collect validation metrics
             metrics = {

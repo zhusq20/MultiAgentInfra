@@ -982,7 +982,7 @@ class RayPPOTrainer:
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from verl.experimental.agent_loop import AgentLoopManager
+            from opentinker.backend_patch.verl.experimental.agent_loop.agent_loop import AgentLoopManager
 
             self.async_rollout_mode = True
             self.async_rollout_manager = AgentLoopManager(
