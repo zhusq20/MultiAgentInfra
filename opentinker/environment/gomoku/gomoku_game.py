@@ -66,6 +66,7 @@ class GomokuGame(AbstractGame):
         max_total_steps: Optional[int] = None,
         max_initial_moves: Optional[int] = None,
         empty_board_prob: Optional[float] = None,
+        agent_role: Optional[str] = None,
     ):
         """Initialize Gomoku game.
 
@@ -75,6 +76,8 @@ class GomokuGame(AbstractGame):
             max_total_steps: Maximum steps before timeout
             max_initial_moves: Maximum initial moves to place before game starts
             empty_board_prob: Probability of starting with an empty board
+            agent_role: For multi-agent mode: "BLACK" (X, first) or "WHITE" (O, second).
+                       If None, uses single-agent mode where LLM always plays as X.
         """
         self.board_size = board_size
         self.win_length = min(win_length, board_size)
@@ -88,6 +91,9 @@ class GomokuGame(AbstractGame):
         self.empty_board_prob = (
             empty_board_prob if empty_board_prob is not None else self.EMPTY_BOARD_PROB
         )
+        # Multi-agent mode: agent_role determines the player's role
+        # None means single-agent mode (LLM plays as X against AI)
+        self.agent_role = agent_role.upper() if agent_role else None
         self._init_game_state()
 
     def _init_game_state(self):
@@ -244,9 +250,25 @@ class GomokuGame(AbstractGame):
     def get_system_prompt(self) -> str:
         """Return the system prompt for Gomoku."""
         center = self.board_size // 2
+        
+        # Multi-agent mode: role-aware prompts
+        if self.agent_role == "BLACK":
+            symbol = "X"
+            role_info = "You play first."
+        elif self.agent_role == "WHITE":
+            symbol = "O"
+            role_info = "You play second (after opponent's first move)."
+        else:
+            # Single-agent mode: LLM always plays as X
+            symbol = "X"
+            role_info = ""
+        
+        role_line = f"You play as {self.agent_role} ({symbol}). {role_info}\n" if self.agent_role else f"You play as {symbol}.\n"
+        
         return (
             f"You are playing Gomoku (Five in a Row) on a {self.board_size}x{self.board_size} board.\n"
-            f"You play as X. Your goal is to get {self.win_length} in a row.\n\n"
+            f"{role_line}"
+            f"Your goal is to get {self.win_length} in a row.\n\n"
             f"IMPORTANT: You MUST respond in the following format:\n"
             f"1. First, analyze the board in <thinking></thinking> tags\n"
             f"2. Then, output your move in <move>row,col</move> tags\n\n"
@@ -255,11 +277,26 @@ class GomokuGame(AbstractGame):
 
     def get_initial_user_message(self) -> str:
         """Return the initial user message for Gomoku."""
-        return (
-            f"Game starts. Here's the board:\n\n"
-            f"{self._render_board()}\n\n"
-            f"Your turn (X). Provide your thinking and move:"
-        )
+        # Multi-agent mode: role-aware initial message
+        if self.agent_role == "BLACK":
+            return (
+                f"Game starts. Here's the empty board:\n\n"
+                f"{self._render_board()}\n\n"
+                f"You play first (X). Analyze and provide your move:"
+            )
+        elif self.agent_role == "WHITE":
+            return (
+                f"Game started. Waiting for opponent's first move.\n\n"
+                f"{self._render_board()}\n\n"
+                f"After opponent moves, provide your thinking and move:"
+            )
+        else:
+            # Single-agent mode
+            return (
+                f"Game starts. Here's the board:\n\n"
+                f"{self._render_board()}\n\n"
+                f"Your turn (X). Provide your thinking and move:"
+            )
 
     def get_state(self) -> Dict[str, Any]:
         """Return current game state."""
@@ -371,10 +408,11 @@ class GomokuGame(AbstractGame):
         self.board = saved_board
         self.move_count = saved_count
 
+        symbol = "X" if self.agent_role != "WHITE" else "O"
         if initial_moves:
-            return f"Current board state:\n\n{board_str}\n\nYour turn (X). Analyze and provide your move:"
+            return f"Current board state:\n\n{board_str}\n\nYour turn ({symbol}). Analyze and provide your move:"
         else:
-            return f"Game starts. Here's the empty board:\n\n{board_str}\n\nYou play first (X). Analyze and provide your move:"
+            return f"Game starts. Here's the empty board:\n\n{board_str}\n\nYou play first ({symbol}). Analyze and provide your move:"
 
     def get_interaction_name(self) -> str:
         """Return interaction name for Gomoku."""

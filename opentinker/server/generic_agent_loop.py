@@ -381,7 +381,9 @@ class GenericAgentLoop(AgentLoopBase):
                 print(f"[GenericAgentLoop] Generated deterministic game_session_id: {game_session_id}")
             
             interaction = self.interaction_map[interaction_name]
-            await interaction.start_interaction(request_id, **interaction_kwargs)
+            # Merge interaction_kwargs with full kwargs to ensure env_kwargs is available
+            combined_kwargs = {**kwargs, **interaction_kwargs}
+            await interaction.start_interaction(request_id, **combined_kwargs)
 
             # Capture initial board state ONLY for Gomoku environment (not other environments)
             initial_board_state = None

@@ -296,6 +296,7 @@ def main(args):
     game_kwargs = {
         "board_size": interaction_config.get("board_size", 9),
         "max_total_steps": interaction_config.get("max_total_steps", 40),
+        "agent_role": agent_role,  # Pass agent role for role-aware prompts
     }
     
     print("\nSetting up GameEnvironment...")

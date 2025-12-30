@@ -168,14 +168,20 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         agent_role = kwargs.get("agent_role", self.agent_role)
         agent_id = f"agent_{agent_role}_{session_id}"
         
-        # Try to create session first (will fail if exists, which is OK)
+        # Extract initial moves if provided (for training from partially played boards)
+        initial_moves = kwargs.get("initial_moves")
+        if not initial_moves and "env_kwargs" in kwargs:
+            initial_moves = kwargs["env_kwargs"].get("initial_moves")
+        
+        # Try to create session first (will fail or reset if exists, which is OK)
         try:
             await self._make_request("POST", "session/create", json_data={
                 "session_id": session_id,
                 "board_size": self.board_size,
                 "max_total_steps": self.max_total_steps,
+                "initial_moves": initial_moves,
             })
-            logger.info(f"[{request_id}] Created session {session_id}")
+            logger.info(f"[{request_id}] Created/Reset session {session_id} with {len(initial_moves or [])} initial moves")
         except httpx.HTTPStatusError as e:
             logger.error(f"[{request_id}] Failed to create session {session_id}: {e}")
             raise

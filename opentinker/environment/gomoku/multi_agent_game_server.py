@@ -80,6 +80,9 @@ class GameSession:
     # Agent tracking
     agents_joined: Dict[str, PlayerRole] = field(default_factory=dict)  # agent_id -> role
     
+    # Initial state
+    initial_moves: List[List[int]] = field(default_factory=list)
+    
     # Synchronization
     move_event: asyncio.Event = field(default_factory=asyncio.Event)
     join_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -89,14 +92,46 @@ class GameSession:
         """Initialize the game board."""
         if not self.board:
             self.board = [["." for _ in range(self.board_size)] for _ in range(self.board_size)]
+        
+        # Apply initial moves if any
+        if self.initial_moves:
+            self._apply_initial_moves()
     
-    def reset(self):
+    def _apply_initial_moves(self):
+        """Apply initial moves to the board and set current turn."""
+        for i, move in enumerate(self.initial_moves):
+            if len(move) >= 2:
+                r, c = move[0], move[1]
+                if 0 <= r < self.board_size and 0 <= c < self.board_size:
+                    symbol = "X" if i % 2 == 0 else "O"
+                    self.board[r][c] = symbol
+                    self.step_count += 1
+                    self.move_history.append({
+                        "step": self.step_count,
+                        "agent": PlayerRole.BLACK.value if i % 2 == 0 else PlayerRole.WHITE.value,
+                        "position": [r, c],
+                        "symbol": symbol,
+                        "is_initial": True
+                    })
+        
+        # Set next turn
+        self.current_turn = PlayerRole.BLACK if len(self.initial_moves) % 2 == 0 else PlayerRole.WHITE
+    
+    def reset(self, initial_moves: Optional[List[List[int]]] = None):
         """Reset the game to initial state."""
+        if initial_moves is not None:
+            self.initial_moves = initial_moves
+            
         self.board = [["." for _ in range(self.board_size)] for _ in range(self.board_size)]
-        self.current_turn = PlayerRole.BLACK
         self.move_history = []
-        self.status = GameStatus.IN_PROGRESS if len(self.agents_joined) == 2 else GameStatus.WAITING
         self.step_count = 0
+        
+        if self.initial_moves:
+            self._apply_initial_moves()
+        else:
+            self.current_turn = PlayerRole.BLACK
+            
+        self.status = GameStatus.IN_PROGRESS if len(self.agents_joined) == 2 else GameStatus.WAITING
         self.move_event = asyncio.Event()
     
     def render_board(self) -> str:
@@ -244,6 +279,7 @@ class CreateSessionRequest(BaseModel):
     board_size: int = 9
     win_length: int = 5
     max_total_steps: int = 40
+    initial_moves: Optional[List[List[int]]] = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -331,10 +367,18 @@ class MultiAgentGameServer:
         async def create_session(request: CreateSessionRequest):
             """Create a new game session."""
             if request.session_id in self.sessions:
+                # If session exists, reset it for a fresh game
+                # This ensures that if a step is restarted or session is reused,
+                # we start from a clean state with new initial moves.
+                session = self.sessions[request.session_id]
+                async with session.lock:
+                    session.reset(initial_moves=request.initial_moves)
+                
+                logger.info(f"Reset existing session {request.session_id}")
                 return CreateSessionResponse(
                     session_id=request.session_id,
-                    status="exists",
-                    message=f"Session {request.session_id} already exists",
+                    status="reset",
+                    message=f"Session {request.session_id} already exists, has been reset.",
                 )
             
             session = GameSession(
@@ -342,6 +386,7 @@ class MultiAgentGameServer:
                 board_size=request.board_size,
                 win_length=request.win_length,
                 max_total_steps=request.max_total_steps,
+                initial_moves=request.initial_moves or [],
             )
             self.sessions[request.session_id] = session
             
