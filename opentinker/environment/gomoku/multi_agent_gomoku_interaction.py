@@ -112,27 +112,85 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
+        max_retries: int = 3,
     ) -> Dict[str, Any]:
-        """Make HTTP request to the game server."""
+        """Make HTTP request to the game server with retry logic.
+        
+        Retries on transient errors (ReadError, ConnectError, Timeout) with
+        exponential backoff to handle temporary connection issues.
+        """
+        import asyncio
+        
         url = f"{self.game_server_url}/{endpoint}"
         timeout = timeout or self.timeout
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if method.upper() == "GET":
+                    response = await self.client.get(url, params=params, timeout=timeout)
+                elif method.upper() == "POST":
+                    response = await self.client.post(url, json=json_data, params=params, timeout=timeout)
+                elif method.upper() == "DELETE":
+                    response = await self.client.delete(url, timeout=timeout)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
 
-        try:
-            if method.upper() == "GET":
-                response = await self.client.get(url, params=params, timeout=timeout)
-            elif method.upper() == "POST":
-                response = await self.client.post(url, json=json_data, params=params, timeout=timeout)
-            elif method.upper() == "DELETE":
-                response = await self.client.delete(url, timeout=timeout)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+                response.raise_for_status()
+                return response.json()
 
-            response.raise_for_status()
-            return response.json()
+            except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                # Transient network errors - retry with backoff
+                last_error = e
+                wait_time = min(2 ** attempt, 10)  # Exponential backoff: 1, 2, 4, max 10 seconds
+                logger.warning(
+                    f"[{endpoint}] Network error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}. "
+                    f"Retrying in {wait_time}s..."
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+                continue
+                
+            except httpx.TimeoutException as e:
+                # Timeout - retry with backoff
+                last_error = e
+                wait_time = min(2 ** attempt, 10)
+                logger.warning(
+                    f"[{endpoint}] Timeout (attempt {attempt + 1}/{max_retries}). "
+                    f"Retrying in {wait_time}s..."
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+                continue
+                
+            except httpx.HTTPStatusError as e:
+                # HTTP errors (4xx, 5xx) - don't retry client errors, retry server errors
+                if e.response.status_code >= 500:
+                    last_error = e
+                    wait_time = min(2 ** attempt, 10)
+                    logger.warning(
+                        f"[{endpoint}] Server error {e.response.status_code} (attempt {attempt + 1}/{max_retries}). "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    # Client error (4xx) - don't retry
+                    logger.error(f"[{endpoint}] HTTP client error: {e}")
+                    raise
+                    
+            except httpx.HTTPError as e:
+                # Other HTTP errors - log and raise
+                logger.error(f"[{endpoint}] Request failed: {type(e).__name__}: {e}")
+                raise
+        
+        # All retries exhausted
+        logger.error(
+            f"[{endpoint}] All {max_retries} retries exhausted. Last error: {type(last_error).__name__}: {last_error}"
+        )
+        raise last_error
 
-        except httpx.HTTPError as e:
-            logger.error(f"Request to {endpoint} failed: {e}")
-            raise
     
     async def start_interaction(
         self,
@@ -261,17 +319,35 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         # Use much longer HTTP timeout since:
         # 1. Server waits for opponent to move (up to self.timeout)
         # 2. Opponent may need multiple retries (each retry = LLM generation time)
-        move_result = await self._make_request(
-            "POST",
-            f"session/{session_id}/move",
-            json_data={
-                "agent_id": agent_id,
-                "move": last_message,
-                "wait_for_opponent": True,  # Block until opponent moves
-                "wait_timeout": self.timeout,  # Server-side wait timeout
-            },
-            timeout=self.timeout * 2,  # HTTP timeout: allow for retries
-        )
+        try:
+            move_result = await self._make_request(
+                "POST",
+                f"session/{session_id}/move",
+                json_data={
+                    "agent_id": agent_id,
+                    "move": last_message,
+                    "wait_for_opponent": True,  # Block until opponent moves
+                    "wait_timeout": self.timeout,  # Server-side wait timeout
+                },
+                timeout=self.timeout * 2,  # HTTP timeout: allow for retries
+            )
+        except Exception as e:
+            # HTTP error during move - handle gracefully instead of crashing
+            # This can happen if opponent's training job was cancelled, server restarted, etc.
+            logger.error(
+                f"[{request_id}] HTTP error during move: {type(e).__name__}: {e}. "
+                f"Session: {session_id}, Agent: {agent_role}. Terminating game gracefully."
+            )
+            
+            # Mark game as ended to prevent abort attempt
+            instance["game_ended"] = True
+            
+            return (
+                True,  # should_terminate - end this rollout
+                f"Game Error: Connection issue - {type(e).__name__}. The game has been terminated.",
+                0.0,  # no reward/penalty for connection errors
+                {"result": "connection_error", "error": str(e), "error_type": type(e).__name__},
+            )
         
         if not move_result["valid"]:
             # Invalid move
@@ -365,7 +441,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             return (
                 True,  # should_terminate - stop this rollout
                 f"Error: Synchronization issue - opponent has not moved.\n{next_observation}",
-                -0.5,  # penalty for sync error
+                0.0,  # no penalty for sync error - simplified reward design
                 {"result": "sync_error", "error": "opponent_move_none"},
             )
 

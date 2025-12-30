@@ -201,7 +201,7 @@ class GameSession:
             return {
                 "valid": True,
                 "observation": self.render_board(),
-                "reward": 0.0,
+                "reward": -0.1,  # Small penalty for draw - encourage winning
                 "done": True,
                 "info": {"result": "draw"},
             }
@@ -519,7 +519,7 @@ class MultiAgentGameServer:
                     return MakeMoveResponse(
                         valid=False,
                         observation=session.render_board(),
-                        reward=-0.5,
+                        reward=0.0,  # No penalty - simplified reward design
                         done=False,
                         info={"result": "not_your_turn"},
                         error=f"Not {agent_role.value}'s turn. Current turn: {session.current_turn.value}",
@@ -541,7 +541,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-1.0,
+                            reward=-0.5,  # Large penalty - 3 invalid moves = -2.0 > loss (-1.0)
                             done=True,
                             info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
                             error=f"Too many invalid moves ({invalid_count}). Game over.",
@@ -551,7 +551,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-0.1,  # Small penalty
+                            reward=-0.5,  # Large penalty per invalid move - discourage invalid moves
                             done=False,  # Game continues, allow retry
                             info={"result": "parse_error", "invalid_count": invalid_count,
                                   "retries_left": session.max_invalid_moves - invalid_count},
@@ -572,7 +572,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-1.0,
+                            reward=-0.5,  # Large penalty - 3 invalid moves = -2.0 > loss (-1.0)
                             done=True,
                             info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
                             error=f"Too many invalid moves ({invalid_count}). Game over.",
@@ -581,7 +581,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-0.1,
+                            reward=-0.5,  # Large penalty per invalid move - discourage invalid moves
                             done=False,
                             info={"result": "out_of_bounds", "invalid_count": invalid_count,
                                   "retries_left": session.max_invalid_moves - invalid_count},
@@ -601,7 +601,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-1.0,
+                            reward=-0.5,  # Large penalty - 3 invalid moves = -2.0 > loss (-1.0)
                             done=True,
                             info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
                             error=f"Too many invalid moves ({invalid_count}). Game over.",
@@ -610,7 +610,7 @@ class MultiAgentGameServer:
                         return MakeMoveResponse(
                             valid=False,
                             observation=session.render_board(),
-                            reward=-0.1,
+                            reward=-0.5,  # Large penalty per invalid move - discourage invalid moves
                             done=False,
                             info={"result": "occupied", "invalid_count": invalid_count,
                                   "retries_left": session.max_invalid_moves - invalid_count},
@@ -804,25 +804,38 @@ class MultiAgentGameServer:
             async with session.lock:
                 if session.status != GameStatus.IN_PROGRESS:
                     # Game already ended, nothing to do
+                    logger.info(
+                        f"[{session_id}] Abort request ignored - game already ended: {session.status.value}"
+                    )
                     return {
                         "status": session.status.value,
                         "message": f"Game already ended with status: {session.status.value}",
                     }
 
+                # Get the aborting agent's role for logging
+                aborting_role = session.agents_joined.get(agent_id, "unknown")
+                opponent_role = "WHITE" if aborting_role == PlayerRole.BLACK else "BLACK"
+                
                 # Mark game as DRAW (abort is neither win nor loss)
                 session.status = GameStatus.DRAW
 
                 # CRITICAL: Notify opponent that game ended
                 session.move_event.set()
+                session.join_event.set()  # Also set join_event in case opponent is waiting to start
 
                 logger.warning(
-                    f"[{session_id}] Game aborted by {agent_id}. Reason: {reason}"
+                    f"[{session_id}] GAME ABORTED by {aborting_role}. "
+                    f"Reason: {reason}, move_count={session.step_count}, "
+                    f"agents={list(session.agents_joined.keys())}. "
+                    f"Opponent ({opponent_role}) notified."
                 )
 
                 return {
                     "status": "aborted",
                     "session_id": session_id,
                     "reason": reason,
+                    "move_count": session.step_count,
+                    "aborting_agent": agent_id,
                 }
 
         @self.app.delete("/session/{session_id}")

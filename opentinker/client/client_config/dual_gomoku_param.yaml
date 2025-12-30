@@ -28,11 +28,11 @@ batch_size: 4
 num_workers: 4
 num_epochs: null
 num_steps: 1000
-save_freq: 100
-test_freq: 50
+save_freq: 1000
+test_freq: 5
 
 # Validation parameters
-val_batch_size: 50
+val_batch_size: 100
 
 # Generation parameters
 temperature: 0.8

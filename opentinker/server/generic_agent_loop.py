@@ -439,23 +439,32 @@ class GenericAgentLoop(AgentLoopBase):
             if instance:
                 session_id = instance.get("session_id")
                 agent_id = instance.get("agent_id")
+                agent_role = instance.get("agent_role", "unknown")
                 # Check if game has properly ended via the game_ended flag
                 # This flag is set by the interaction when game terminates normally
                 game_ended = instance.get("game_ended", False)
                 
+                # Get termination reason for detailed logging
+                termination_reason = agent_data.extra_fields.get("termination_reason", "unknown")
+                
                 if not game_ended and session_id and agent_id:
                     logger.warning(
-                        f"[{request_id}] Agent loop terminated early (game not ended), aborting game {session_id}"
+                        f"[{request_id[:8]}] GAME ABORT: session={session_id}, agent={agent_role}, "
+                        f"reason={termination_reason}, user_turns={agent_data.user_turns}, "
+                        f"assistant_turns={agent_data.assistant_turns}, "
+                        f"response_tokens={len(agent_data.response_mask)}"
                     )
                     try:
+                        abort_reason = f"agent_loop_early_termination:{termination_reason}"
                         await interaction._make_request(
                             "POST",
                             f"session/{session_id}/abort",
-                            params={"agent_id": agent_id, "reason": "agent_loop_early_termination"},
+                            params={"agent_id": agent_id, "reason": abort_reason},
                             timeout=5.0,
                         )
+                        logger.info(f"[{request_id[:8]}] Successfully aborted game {session_id}")
                     except Exception as e:
-                        logger.warning(f"[{request_id}] Failed to abort game: {e}")
+                        logger.warning(f"[{request_id[:8]}] Failed to abort game {session_id}: {e}")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -617,18 +626,42 @@ class GenericAgentLoop(AgentLoopBase):
         if response_log_probs:
             agent_data.response_logprobs += response_log_probs
 
-        # Check termination conditions
+        # Check termination conditions with detailed logging
+        termination_reason = None
         if len(agent_data.response_mask) >= self.response_length:
+            termination_reason = "response_length_limit"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"response_tokens={len(agent_data.response_mask)}, limit={self.response_length}, "
+                f"user_turns={agent_data.user_turns}, assistant_turns={agent_data.assistant_turns}"
+            )
+            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
+        
         # Use > instead of >= so that max_assistant_turns=1 allows 1 generation + 1 step
         # before terminating (instead of terminating immediately after first generation)
         if (
             self.max_assistant_turns
             and agent_data.assistant_turns > self.max_assistant_turns
         ):
+            termination_reason = "max_assistant_turns_exceeded"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"assistant_turns={agent_data.assistant_turns}, limit={self.max_assistant_turns}, "
+                f"user_turns={agent_data.user_turns}, response_tokens={len(agent_data.response_mask)}"
+            )
+            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
+        
         # Similarly, max_user_turns=1 means user can ask once, then terminate after next generation
         if self.max_user_turns and agent_data.user_turns > self.max_user_turns:
+            termination_reason = "max_user_turns_exceeded"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {termination_reason}. "
+                f"user_turns={agent_data.user_turns}, limit={self.max_user_turns}, "
+                f"assistant_turns={agent_data.assistant_turns}, response_tokens={len(agent_data.response_mask)}"
+            )
+            agent_data.extra_fields["termination_reason"] = termination_reason
             return GenericAgentState.TERMINATED
 
         # Add assistant message to conversation history
