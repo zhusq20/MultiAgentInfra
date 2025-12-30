@@ -59,7 +59,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         session_id: str = "default_session",
         board_size: int = 9,
         max_total_steps: int = 40,
-        timeout: float = 300,
+        timeout: float = 600,  # Increased timeout for LLM retries
         **kwargs,
     ):
         """Initialize the multi-agent Gomoku interaction.
@@ -215,6 +215,7 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             "agent_id": agent_id,
             "agent_role": agent_role,
             "initial_board_state": join_result["board"],
+            "game_ended": False,  # Track if game has properly ended
         }
         
         # If WHITE, wait for BLACK's first move
@@ -257,28 +258,60 @@ class MultiAgentGomokuInteraction(BaseInteraction):
         
         # Submit move to game server with wait_for_opponent=True
         # This blocks until opponent moves, combining move+wait into atomic operation
-        move_result = await self._make_request("POST", f"session/{session_id}/move", json_data={
-            "agent_id": agent_id,
-            "move": last_message,
-            "wait_for_opponent": True,  # Block until opponent moves
-        })
+        # Use much longer HTTP timeout since:
+        # 1. Server waits for opponent to move (up to self.timeout)
+        # 2. Opponent may need multiple retries (each retry = LLM generation time)
+        move_result = await self._make_request(
+            "POST",
+            f"session/{session_id}/move",
+            json_data={
+                "agent_id": agent_id,
+                "move": last_message,
+                "wait_for_opponent": True,  # Block until opponent moves
+                "wait_timeout": self.timeout,  # Server-side wait timeout
+            },
+            timeout=self.timeout * 2,  # HTTP timeout: allow for retries
+        )
         
         if not move_result["valid"]:
-            # Invalid move - game ends with penalty
+            # Invalid move
             logger.warning(
                 f"[{request_id}] Invalid move: {move_result.get('error')}. "
                 f"Move text: {last_message[:100]}"
             )
-            return (
-                True,  # should_terminate
-                f"Invalid move: {move_result.get('error')}\n{move_result['observation']}",
-                move_result["reward"],
-                move_result["info"],
-            )
+
+            if move_result["done"]:
+                # Too many invalid moves or other terminal error - game ends
+                # This final failed attempt SHOULD be added to messages
+                return (
+                    True,  # should_terminate
+                    f"Game Over - Invalid move: {move_result.get('error')}\n{move_result['observation']}",
+                    move_result["reward"],
+                    move_result["info"],
+                )
+            else:
+                # Allow retry - return error message to LLM
+                # The failed attempt should NOT be added to messages
+                retries_left = move_result["info"].get("retries_left", "?")
+                retry_info = {
+                    **move_result["info"],
+                    "skip_assistant_message": True,  # Signal to agent loop: don't add failed attempt to messages
+                }
+                return (
+                    False,  # should_terminate=False, allow retry
+                    f"Invalid move: {move_result.get('error')}\n"
+                    f"Please try again. Retries left: {retries_left}\n"
+                    f"{move_result['observation']}",
+                    move_result["reward"],
+                    retry_info,
+                )
         
         if move_result["done"]:
             # Game ended (win, loss, or draw)
             result = move_result["info"].get("result", "unknown")
+            
+            # Mark game as properly ended (for abort detection)
+            instance["game_ended"] = True
             
             # Check if we won or lost based on result
             if "win" in result.lower():
@@ -303,16 +336,45 @@ class MultiAgentGomokuInteraction(BaseInteraction):
                 move_result["info"],
             )
         
-        # Game continues - opponent has moved (already waited via wait_for_opponent=True)
-        opponent_move = move_result.get("opponent_move", {})
-        next_observation = move_result.get("next_observation", move_result["observation"])
-        
-        opponent_pos = opponent_move.get("position", ["?", "?"])
+        # Game continues - opponent should have moved (waited via wait_for_opponent=True)
+        opponent_move = move_result.get("opponent_move")
+        next_observation = move_result.get("next_observation") or move_result["observation"]
+
+        if opponent_move is None:
+            # Opponent hasn't moved yet - this is an error state
+            # The agent should NOT try to move again, as it's not their turn
+            logger.error(
+                f"[{request_id}] opponent_move is None but game not ended. "
+                f"This indicates a synchronization issue. Agent should wait."
+            )
+
+            # CRITICAL: Abort the game so opponent can exit their wait loop
+            # Without this, opponent will wait forever (up to timeout)
+            try:
+                await self._make_request(
+                    "POST",
+                    f"session/{session_id}/abort",
+                    params={"agent_id": agent_id, "reason": "opponent_move_none"},
+                    timeout=5.0,
+                )
+                logger.info(f"[{request_id}] Aborted game {session_id} due to sync error")
+            except Exception as e:
+                logger.warning(f"[{request_id}] Failed to abort game: {e}")
+
+            # Return termination to prevent the agent from making invalid moves
+            return (
+                True,  # should_terminate - stop this rollout
+                f"Error: Synchronization issue - opponent has not moved.\n{next_observation}",
+                -0.5,  # penalty for sync error
+                {"result": "sync_error", "error": "opponent_move_none"},
+            )
+
+        opponent_pos = opponent_move.get("position") or ["?", "?"]
         observation = (
             f"Opponent moved to ({opponent_pos[0]}, {opponent_pos[1]}). Your turn.\n"
             f"{next_observation}"
         )
-        
+
         return (
             False,  # should_terminate
             observation,

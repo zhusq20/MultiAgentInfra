@@ -64,25 +64,27 @@ class GameStatus(str, Enum):
 @dataclass
 class GameSession:
     """Manages a single game between two agents."""
-    
+
     session_id: str
     board_size: int = 9
     win_length: int = 5
     max_total_steps: int = 40
-    
+    max_invalid_moves: int = 3  # Max invalid moves before game ends
+
     # Game state
     board: List[List[str]] = field(default_factory=list)
     current_turn: PlayerRole = PlayerRole.BLACK
     move_history: List[Dict[str, Any]] = field(default_factory=list)
     status: GameStatus = GameStatus.WAITING
     step_count: int = 0
-    
+
     # Agent tracking
     agents_joined: Dict[str, PlayerRole] = field(default_factory=dict)  # agent_id -> role
-    
+    invalid_move_counts: Dict[str, int] = field(default_factory=dict)  # agent_id -> count
+
     # Initial state
     initial_moves: List[List[int]] = field(default_factory=list)
-    
+
     # Synchronization
     move_event: asyncio.Event = field(default_factory=asyncio.Event)
     join_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -121,16 +123,17 @@ class GameSession:
         """Reset the game to initial state."""
         if initial_moves is not None:
             self.initial_moves = initial_moves
-            
+
         self.board = [["." for _ in range(self.board_size)] for _ in range(self.board_size)]
         self.move_history = []
         self.step_count = 0
-        
+        self.invalid_move_counts = {}  # Reset invalid move counters
+
         if self.initial_moves:
             self._apply_initial_moves()
         else:
             self.current_turn = PlayerRole.BLACK
-            
+
         self.status = GameStatus.IN_PROGRESS if len(self.agents_joined) == 2 else GameStatus.WAITING
         self.move_event = asyncio.Event()
     
@@ -163,36 +166,15 @@ class GameSession:
     
     def apply_move(self, row: int, col: int, agent_role: PlayerRole) -> Dict[str, Any]:
         """Apply a move to the board.
-        
+
+        Note: Validation is done in make_move before calling this method.
+
         Returns:
             Dict with observation, reward, done, and info
         """
         symbol = "X" if agent_role == PlayerRole.BLACK else "O"
-        
-        # Validate move
-        if row < 0 or row >= self.board_size or col < 0 or col >= self.board_size:
-            self.status = GameStatus.DRAW  # Terminate game on invalid move
-            return {
-                "valid": False,
-                "error": f"Move ({row}, {col}) is out of bounds.",
-                "observation": self.render_board(),
-                "reward": -1.0,
-                "done": True,
-                "info": {"result": "invalid_move", "error": "out_of_bounds"},
-            }
-        
-        if self.board[row][col] != ".":
-            self.status = GameStatus.DRAW  # Terminate game on invalid move
-            return {
-                "valid": False,
-                "error": f"Position ({row}, {col}) is already occupied.",
-                "observation": self.render_board(),
-                "reward": -1.0,
-                "done": True,
-                "info": {"result": "invalid_move", "error": "occupied"},
-            }
-        
-        # Apply move
+
+        # Apply move (validation already done in make_move)
         self.board[row][col] = symbol
         self.step_count += 1
         self.move_history.append({
@@ -310,6 +292,7 @@ class MakeMoveRequest(BaseModel):
     agent_id: str
     move: str  # Format: "row,col" or "<move>row,col</move>"
     wait_for_opponent: bool = False  # If True, block until opponent moves
+    wait_timeout: float = 600  # Timeout for waiting for opponent (seconds)
 
 
 class MakeMoveResponse(BaseModel):
@@ -367,13 +350,38 @@ class MultiAgentGameServer:
         async def create_session(request: CreateSessionRequest):
             """Create a new game session."""
             if request.session_id in self.sessions:
-                # If session exists, reset it for a fresh game
-                # This ensures that if a step is restarted or session is reused,
-                # we start from a clean state with new initial moves.
                 session = self.sessions[request.session_id]
                 async with session.lock:
+                    # CRITICAL FIX: Only reset if no agents have joined or game is finished
+                    # If game is in progress OR agents are waiting to start, do not reset.
+                    # This prevents race conditions where:
+                    # 1. BLACK joins, status=WAITING
+                    # 2. WHITE calls create_session, would reset and clear BLACK's join
+                    # 3. BLACK's wait_for_start times out or sees corrupted state
+                    if session.status == GameStatus.IN_PROGRESS:
+                        logger.info(f"Session {request.session_id} already in progress, skipping reset")
+                        return CreateSessionResponse(
+                            session_id=request.session_id,
+                            status="in_progress",
+                            message=f"Session {request.session_id} already in progress, not reset.",
+                        )
+
+                    if session.agents_joined:
+                        # Some agents have joined but game hasn't started yet
+                        # Don't reset - let the new agent join
+                        logger.info(
+                            f"Session {request.session_id} has {len(session.agents_joined)} agents waiting, "
+                            f"skipping reset"
+                        )
+                        return CreateSessionResponse(
+                            session_id=request.session_id,
+                            status="waiting",
+                            message=f"Session {request.session_id} has agents waiting, not reset.",
+                        )
+
+                    # Safe to reset if no agents have joined and game is not in progress
                     session.reset(initial_moves=request.initial_moves)
-                
+
                 logger.info(f"Reset existing session {request.session_id}")
                 return CreateSessionResponse(
                     session_id=request.session_id,
@@ -520,22 +528,107 @@ class MultiAgentGameServer:
                 # Parse move
                 row, col = self._parse_move(request.move)
                 if row is None or col is None:
-                    return MakeMoveResponse(
-                        valid=False,
-                        observation=session.render_board(),
-                        reward=-1.0,
-                        done=True,
-                        info={"result": "parse_error"},
-                        error=f"Could not parse move: {request.move}",
-                    )
-                
-                # Apply move
+                    # Track invalid move count
+                    session.invalid_move_counts[request.agent_id] = \
+                        session.invalid_move_counts.get(request.agent_id, 0) + 1
+                    invalid_count = session.invalid_move_counts[request.agent_id]
+
+                    if invalid_count >= session.max_invalid_moves:
+                        # Too many invalid moves, end game
+                        session.status = GameStatus.DRAW
+                        # IMPORTANT: Notify opponent that game ended
+                        session.move_event.set()
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-1.0,
+                            done=True,
+                            info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
+                            error=f"Too many invalid moves ({invalid_count}). Game over.",
+                        )
+                    else:
+                        # Allow retry
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-0.1,  # Small penalty
+                            done=False,  # Game continues, allow retry
+                            info={"result": "parse_error", "invalid_count": invalid_count,
+                                  "retries_left": session.max_invalid_moves - invalid_count},
+                            error=f"Could not parse move: {request.move}. Please use format <move>row,col</move>. "
+                                  f"Retries left: {session.max_invalid_moves - invalid_count}",
+                        )
+
+                # Check if position is valid before applying
+                if row < 0 or row >= session.board_size or col < 0 or col >= session.board_size:
+                    session.invalid_move_counts[request.agent_id] = \
+                        session.invalid_move_counts.get(request.agent_id, 0) + 1
+                    invalid_count = session.invalid_move_counts[request.agent_id]
+
+                    if invalid_count >= session.max_invalid_moves:
+                        session.status = GameStatus.DRAW
+                        # IMPORTANT: Notify opponent that game ended
+                        session.move_event.set()
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-1.0,
+                            done=True,
+                            info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
+                            error=f"Too many invalid moves ({invalid_count}). Game over.",
+                        )
+                    else:
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-0.1,
+                            done=False,
+                            info={"result": "out_of_bounds", "invalid_count": invalid_count,
+                                  "retries_left": session.max_invalid_moves - invalid_count},
+                            error=f"Move ({row}, {col}) is out of bounds. Board is {session.board_size}x{session.board_size}. "
+                                  f"Retries left: {session.max_invalid_moves - invalid_count}",
+                        )
+
+                if session.board[row][col] != ".":
+                    session.invalid_move_counts[request.agent_id] = \
+                        session.invalid_move_counts.get(request.agent_id, 0) + 1
+                    invalid_count = session.invalid_move_counts[request.agent_id]
+
+                    if invalid_count >= session.max_invalid_moves:
+                        session.status = GameStatus.DRAW
+                        # IMPORTANT: Notify opponent that game ended
+                        session.move_event.set()
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-1.0,
+                            done=True,
+                            info={"result": "too_many_invalid_moves", "invalid_count": invalid_count},
+                            error=f"Too many invalid moves ({invalid_count}). Game over.",
+                        )
+                    else:
+                        return MakeMoveResponse(
+                            valid=False,
+                            observation=session.render_board(),
+                            reward=-0.1,
+                            done=False,
+                            info={"result": "occupied", "invalid_count": invalid_count,
+                                  "retries_left": session.max_invalid_moves - invalid_count},
+                            error=f"Position ({row}, {col}) is already occupied. "
+                                  f"Retries left: {session.max_invalid_moves - invalid_count}",
+                        )
+
+                # Valid move - reset invalid move counter and apply
+                session.invalid_move_counts[request.agent_id] = 0
                 result = session.apply_move(row, col, agent_role)
+                
+                # Record current move count BEFORE setting event, used for wait loop below
+                my_move_count = len(session.move_history)
                 
                 # Notify opponent that we moved
                 session.move_event.set()
                 
-                logger.info(f"[{session_id}] {agent_role.value} moved to ({row}, {col})")
+                logger.info(f"[{session_id}] {agent_role.value} moved to ({row}, {col}), move_count={my_move_count}")
                 
                 # If game ended or wait_for_opponent=False, return immediately
                 if result["done"] or not request.wait_for_opponent:
@@ -550,32 +643,54 @@ class MultiAgentGameServer:
             
             # wait_for_opponent=True: Wait for opponent's move outside the lock
             # This allows the opponent to acquire the lock and make their move
-            timeout = 300  # Use a reasonable timeout for opponent's move
+            timeout = request.wait_timeout  # Use configurable timeout
             start_time = time.time()
-            
-            while session.current_turn == agent_role or session.status != GameStatus.IN_PROGRESS:
-                # If game already ended, break
+            logger.info(f"[{session_id}] {agent_role.value} waiting for opponent (timeout={timeout}s)")
+
+            # RELIABLE WAIT STRATEGY:
+            # Instead of relying solely on move_event (which can have race conditions),
+            # we use move_history length as the authoritative signal.
+            # When opponent moves, move_history length will increase beyond my_move_count.
+            while True:
+                # Check termination conditions
                 if session.status != GameStatus.IN_PROGRESS:
                     break
-                # If it's no longer our turn, opponent has moved
-                if session.current_turn != agent_role:
-                    break
-                    
+                
+                # Check if opponent has moved by comparing move_history length
+                if len(session.move_history) > my_move_count:
+                    # Opponent moved! Verify it's not somehow our own move (shouldn't happen)
+                    last_move = session.move_history[-1]
+                    if last_move.get("agent") != agent_role.value:
+                        break  # Opponent moved, we can return
+                    else:
+                        # Safety: update my_move_count if somehow we moved again
+                        my_move_count = len(session.move_history)
+                
+                # Check timeout
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    raise HTTPException(408, "Timeout waiting for opponent's move")
+                
+                # Wait for move event signal (with short timeout to allow re-checking)
                 try:
-                    remaining = timeout - (time.time() - start_time)
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError()
-                    
-                    # Wait for move event
-                    await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 1.0))
+                    await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 0.5))
                     session.move_event.clear()
                 except asyncio.TimeoutError:
-                    if time.time() - start_time >= timeout:
-                        raise HTTPException(408, "Timeout waiting for opponent's move")
+                    # Timeout is normal in polling loop, just re-check conditions
                     continue
             
             # Return the updated state after opponent moved
-            opponent_last_move = session.move_history[-1] if session.move_history else None
+            opponent_last_move = None
+            if session.move_history and len(session.move_history) > my_move_count:
+                opponent_last_move = session.move_history[-1]
+                # Double-check it's opponent's move
+                if opponent_last_move.get("agent") == agent_role.value:
+                    logger.warning(
+                        f"[{session_id}] Last move is our own ({agent_role.value}), "
+                        f"opponent may not have moved yet. move_history length: {len(session.move_history)}"
+                    )
+                    opponent_last_move = None
+
             return MakeMoveResponse(
                 valid=result["valid"],
                 observation=result["observation"],
@@ -627,13 +742,10 @@ class MultiAgentGameServer:
                     remaining = timeout - (time.time() - start_time)
                     if remaining <= 0:
                         raise asyncio.TimeoutError()
-                    
-                    # Wait for move event or timeout
-                    # We don't clear the event here to avoid race conditions
-                    # Instead, make_move will set it, and we check state in the loop
-                    await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 1.0))
-                    
-                    # Clear it after we've woken up so the next waiter can wait
+
+                    # Wait for move event with short timeout for robustness
+                    await asyncio.wait_for(session.move_event.wait(), timeout=min(remaining, 0.5))
+                    # Clear event after waking up to prepare for next iteration
                     session.move_event.clear()
                 except asyncio.TimeoutError:
                     if time.time() - start_time >= timeout:
@@ -677,6 +789,42 @@ class MultiAgentGameServer:
             logger.info(f"Reset session {session_id}")
             return {"status": "reset", "session_id": session_id}
         
+        @self.app.post("/session/{session_id}/abort")
+        async def abort_game(session_id: str, agent_id: str, reason: str = "client_abort"):
+            """Abort an in-progress game.
+
+            This is called when one agent needs to terminate early (e.g., sync error).
+            It marks the game as DRAW and notifies the opponent so they can exit.
+            """
+            if session_id not in self.sessions:
+                raise HTTPException(404, f"Session {session_id} not found")
+
+            session = self.sessions[session_id]
+
+            async with session.lock:
+                if session.status != GameStatus.IN_PROGRESS:
+                    # Game already ended, nothing to do
+                    return {
+                        "status": session.status.value,
+                        "message": f"Game already ended with status: {session.status.value}",
+                    }
+
+                # Mark game as DRAW (abort is neither win nor loss)
+                session.status = GameStatus.DRAW
+
+                # CRITICAL: Notify opponent that game ended
+                session.move_event.set()
+
+                logger.warning(
+                    f"[{session_id}] Game aborted by {agent_id}. Reason: {reason}"
+                )
+
+                return {
+                    "status": "aborted",
+                    "session_id": session_id,
+                    "reason": reason,
+                }
+
         @self.app.delete("/session/{session_id}")
         async def delete_session(session_id: str):
             """Delete a game session."""

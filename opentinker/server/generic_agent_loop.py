@@ -428,6 +428,35 @@ class GenericAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = GenericAgentState.TERMINATED
 
+        # CRITICAL: Abort game if we terminated early (before game ended)
+        # This is needed when agent loop terminates due to:
+        # 1. response_length limit
+        # 2. max_user_turns / max_assistant_turns limit  
+        # 3. context overflow
+        # Without this, opponent would wait forever for our next move.
+        if interaction is not None and hasattr(interaction, '_instance_dict'):
+            instance = interaction._instance_dict.get(request_id)
+            if instance:
+                session_id = instance.get("session_id")
+                agent_id = instance.get("agent_id")
+                # Check if game has properly ended via the game_ended flag
+                # This flag is set by the interaction when game terminates normally
+                game_ended = instance.get("game_ended", False)
+                
+                if not game_ended and session_id and agent_id:
+                    logger.warning(
+                        f"[{request_id}] Agent loop terminated early (game not ended), aborting game {session_id}"
+                    )
+                    try:
+                        await interaction._make_request(
+                            "POST",
+                            f"session/{session_id}/abort",
+                            params={"agent_id": agent_id, "reason": "agent_loop_early_termination"},
+                            timeout=5.0,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[{request_id}] Failed to abort game: {e}")
+
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
         prompt_ids = agent_data.prompt_ids[
@@ -635,7 +664,31 @@ class GenericAgentLoop(AgentLoopBase):
         ) = await agent_data.interaction.generate_response(
             agent_data.request_id, agent_data.messages, **agent_data.interaction_kwargs
         )
-        agent_data.user_turns += 1
+
+        # Check if we should skip adding the assistant message to history
+        # This is used for retry scenarios where the failed attempt should not be recorded
+        skip_assistant_message = info.get("skip_assistant_message", False) if info else False
+
+        if skip_assistant_message:
+            # Remove the last assistant message from conversation history
+            # (it was added in _handle_generated_state before calling interaction)
+            if agent_data.messages and agent_data.messages[-1]["role"] == "assistant":
+                agent_data.messages.pop()
+
+            # Mark the failed response tokens with mask=0 so they don't contribute to loss
+            # Find where the assistant response tokens start (they were just added)
+            num_response_tokens = len(agent_data.response_ids)
+            if num_response_tokens > 0:
+                # Set mask to 0 for these tokens (exclude from loss)
+                start_idx = len(agent_data.response_mask) - num_response_tokens
+                for i in range(start_idx, len(agent_data.response_mask)):
+                    agent_data.response_mask[i] = 0
+
+            # Don't increment user_turns for retry attempts
+            # This prevents hitting max_user_turns limit due to retries
+        else:
+            # Only increment user_turns for successful interactions
+            agent_data.user_turns += 1
 
         # Record turn-level reward (will be summed for final reward)
         if reward is not None:
@@ -644,7 +697,8 @@ class GenericAgentLoop(AgentLoopBase):
         # Store environment info under a SINGLE key to ensure consistent structure
         # across all samples (avoids DataProto.concat assertion errors when different
         # samples return different info keys)
-        if info:
+        # Don't store env_info for retry attempts (skip_assistant_message=True)
+        if info and not skip_assistant_message:
             # Append to list instead of overwriting (for multi-turn)
             if "env_info" not in agent_data.extra_fields:
                 agent_data.extra_fields["env_info"] = []
@@ -652,7 +706,11 @@ class GenericAgentLoop(AgentLoopBase):
 
         # Construct user message from observation
         add_messages: list[dict[str, Any]] = [{"role": "user", "content": observation}]
-        agent_data.messages.extend(add_messages)
+
+        # Only add to messages if NOT a retry attempt
+        # Retry attempts: observation goes to prompt_ids (for LLM context) but NOT to messages (for recording)
+        if not skip_assistant_message:
+            agent_data.messages.extend(add_messages)
 
         # Tokenize the user message (environment observation)
         if self.processor is not None:
