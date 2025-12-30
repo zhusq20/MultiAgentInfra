@@ -94,6 +94,15 @@ class GomokuGame(AbstractGame):
         # Multi-agent mode: agent_role determines the player's role
         # None means single-agent mode (LLM plays as X against AI)
         self.agent_role = agent_role.upper() if agent_role else None
+        
+        # Determine symbols based on role
+        if self.agent_role == "WHITE":
+            self.llm_symbol = self.PLAYER_O
+            self.env_symbol = self.PLAYER_X
+        else:
+            self.llm_symbol = self.PLAYER_X
+            self.env_symbol = self.PLAYER_O
+            
         self._init_game_state()
 
     def _init_game_state(self):
@@ -176,20 +185,20 @@ class GomokuGame(AbstractGame):
         self.consecutive_invalid_moves = 0
 
         # Make the move
-        self.board[row][col] = self.PLAYER_X
+        self.board[row][col] = self.llm_symbol
         self.move_count += 1
         self.last_move = (row, col)
 
         # Check for win
-        if self._check_win(row, col, self.PLAYER_X):
+        if self._check_win(row, col, self.llm_symbol):
             self.game_over = True
-            self.winner = self.PLAYER_X
+            self.winner = self.llm_symbol
             return StepResult(
                 observation=f"Congratulations! You win!\n\n{self._render_board()}",
                 reward=self.REWARD_WIN,
                 done=True,
                 info={
-                    "winner": "X",
+                    "winner": self.llm_symbol,
                     "move": [row, col],
                     "board_state": self.get_state(),
                 },
@@ -207,18 +216,18 @@ class GomokuGame(AbstractGame):
 
         # Environment's turn
         env_row, env_col = self._make_env_move()
-        self.board[env_row][env_col] = self.PLAYER_O
+        self.board[env_row][env_col] = self.env_symbol
         self.move_count += 1
 
         # Check if environment wins
-        if self._check_win(env_row, env_col, self.PLAYER_O):
+        if self._check_win(env_row, env_col, self.env_symbol):
             self.game_over = True
-            self.winner = self.PLAYER_O
+            self.winner = self.env_symbol
             return StepResult(
-                observation=f"You lose! Opponent placed O at ({env_row},{env_col}).\n\n{self._render_board()}",
+                observation=f"You lose! Opponent placed {self.env_symbol} at ({env_row},{env_col}).\n\n{self._render_board()}",
                 reward=self.REWARD_LOSS,
                 done=True,
-                info={"winner": "O", "env_move": [env_row, env_col]},
+                info={"winner": self.env_symbol, "env_move": [env_row, env_col]},
             )
 
         # Check for draw after environment move
@@ -233,9 +242,9 @@ class GomokuGame(AbstractGame):
 
         # Game continues
         observation = (
-            f"Opponent placed O at ({env_row},{env_col}).\n\n"
+            f"Opponent placed {self.env_symbol} at ({env_row},{env_col}).\n\n"
             f"{self._render_board()}\n\n"
-            f"Your turn (X). Analyze and provide your move:\n"
+            f"Your turn ({self.llm_symbol}). Analyze and provide your move:\n"
             f"<thinking>your analysis</thinking>\n"
             f"<move>row,col</move>"
         )
@@ -569,16 +578,16 @@ class GomokuGame(AbstractGame):
 
         # Check for winning move
         for r, c in empty_cells:
-            self.board[r][c] = self.PLAYER_O
-            if self._check_win(r, c, self.PLAYER_O):
+            self.board[r][c] = self.env_symbol
+            if self._check_win(r, c, self.env_symbol):
                 self.board[r][c] = self.EMPTY
                 return r, c
             self.board[r][c] = self.EMPTY
 
         # Block opponent's winning move
         for r, c in empty_cells:
-            self.board[r][c] = self.PLAYER_X
-            if self._check_win(r, c, self.PLAYER_X):
+            self.board[r][c] = self.llm_symbol
+            if self._check_win(r, c, self.llm_symbol):
                 self.board[r][c] = self.EMPTY
                 return r, c
             self.board[r][c] = self.EMPTY
@@ -589,8 +598,8 @@ class GomokuGame(AbstractGame):
         for r, c in empty_cells:
             score = 0
             for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
-                count = self._count_in_direction(r, c, dr, dc, self.PLAYER_O)
-                count += self._count_in_direction(r, c, -dr, -dc, self.PLAYER_O)
+                count = self._count_in_direction(r, c, dr, dc, self.env_symbol)
+                count += self._count_in_direction(r, c, -dr, -dc, self.env_symbol)
                 score += count
 
             # Center preference

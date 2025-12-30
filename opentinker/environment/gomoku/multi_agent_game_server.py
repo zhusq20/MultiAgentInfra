@@ -126,16 +126,17 @@ class GameSession:
 
         self.board = [["." for _ in range(self.board_size)] for _ in range(self.board_size)]
         self.move_history = []
-        self.step_count = 0
+        self.status = GameStatus.WAITING
+        self.agents_joined = {}  # Clear joined agents on reset
         self.invalid_move_counts = {}  # Reset invalid move counters
+        self.join_event.clear()  # Reset join event
+        self.move_event = asyncio.Event()
 
+        self.step_count = 0
         if self.initial_moves:
             self._apply_initial_moves()
         else:
             self.current_turn = PlayerRole.BLACK
-
-        self.status = GameStatus.IN_PROGRESS if len(self.agents_joined) == 2 else GameStatus.WAITING
-        self.move_event = asyncio.Event()
     
     def render_board(self) -> str:
         """Render the board as a text string."""
@@ -315,6 +316,7 @@ class WaitForOpponentResponse(BaseModel):
     last_move: Optional[Dict[str, Any]]
     done: bool
     info: Dict[str, Any]
+    reward: float = 0.0
 
 
 class GameStateResponse(BaseModel):
@@ -366,7 +368,7 @@ class MultiAgentGameServer:
                             message=f"Session {request.session_id} already in progress, not reset.",
                         )
 
-                    if session.agents_joined:
+                    if session.status == GameStatus.WAITING and session.agents_joined:
                         # Some agents have joined but game hasn't started yet
                         # Don't reset - let the new agent join
                         logger.info(
@@ -680,6 +682,19 @@ class MultiAgentGameServer:
                     continue
             
             # Return the updated state after opponent moved
+            reward = result["reward"]
+            done = session.status != GameStatus.IN_PROGRESS
+            
+            # If game ended while waiting, update reward
+            if done and reward == 0.0:
+                if session.status == GameStatus.DRAW:
+                    reward = -0.1
+                elif "win" in session.status.value:
+                    # If this agent role is NOT the winner, it's a loss
+                    winner_role = PlayerRole.BLACK if session.status == GameStatus.BLACK_WIN else PlayerRole.WHITE
+                    if agent_role != winner_role:
+                        reward = -1.0
+            
             opponent_last_move = None
             if session.move_history and len(session.move_history) > my_move_count:
                 opponent_last_move = session.move_history[-1]
@@ -694,8 +709,8 @@ class MultiAgentGameServer:
             return MakeMoveResponse(
                 valid=result["valid"],
                 observation=result["observation"],
-                reward=result["reward"],
-                done=session.status != GameStatus.IN_PROGRESS,
+                reward=reward,
+                done=done,
                 info=result["info"] if session.status == GameStatus.IN_PROGRESS else {"result": session.status.value},
                 error=result.get("error"),
                 next_observation=session.render_board(),
@@ -717,12 +732,21 @@ class MultiAgentGameServer:
             
             # If game ended, return immediately
             if session.status != GameStatus.IN_PROGRESS:
+                reward = 0.0
+                if session.status == GameStatus.DRAW:
+                    reward = -0.1
+                elif "win" in session.status.value:
+                    winner_role = PlayerRole.BLACK if session.status == GameStatus.BLACK_WIN else PlayerRole.WHITE
+                    if agent_role != winner_role:
+                        reward = -1.0
+                
                 return WaitForOpponentResponse(
                     opponent_moved=True,
                     observation=session.render_board(),
                     last_move=session.move_history[-1] if session.move_history else None,
                     done=True,
                     info={"result": session.status.value},
+                    reward=reward,
                 )
             
             # If it's already our turn, opponent has moved
@@ -733,6 +757,7 @@ class MultiAgentGameServer:
                     last_move=session.move_history[-1] if session.move_history else None,
                     done=session.status != GameStatus.IN_PROGRESS,
                     info={"result": "continue" if session.status == GameStatus.IN_PROGRESS else session.status.value},
+                    reward=0.0,
                 )
             
             # Wait for opponent's move
@@ -752,12 +777,22 @@ class MultiAgentGameServer:
                         raise HTTPException(408, "Timeout waiting for opponent")
                     continue
             
+            reward = 0.0
+            if session.status != GameStatus.IN_PROGRESS:
+                if session.status == GameStatus.DRAW:
+                    reward = -0.1
+                elif "win" in session.status.value:
+                    winner_role = PlayerRole.BLACK if session.status == GameStatus.BLACK_WIN else PlayerRole.WHITE
+                    if agent_role != winner_role:
+                        reward = -1.0
+            
             return WaitForOpponentResponse(
                 opponent_moved=True,
                 observation=session.render_board(),
                 last_move=session.move_history[-1] if session.move_history else None,
                 done=session.status != GameStatus.IN_PROGRESS,
                 info={"result": "continue" if session.status == GameStatus.IN_PROGRESS else session.status.value},
+                reward=reward,
             )
         
         @self.app.get("/session/{session_id}/state", response_model=GameStateResponse)

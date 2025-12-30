@@ -358,6 +358,8 @@ class MultiAgentGomokuInteraction(BaseInteraction):
 
             if move_result["done"]:
                 # Too many invalid moves or other terminal error - game ends
+                # CRITICAL: Mark game as ended to prevent abort attempt
+                instance["game_ended"] = True
                 # This final failed attempt SHOULD be added to messages
                 return (
                     True,  # should_terminate
@@ -389,22 +391,28 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             # Mark game as properly ended (for abort detection)
             instance["game_ended"] = True
             
-            # Check if we won or lost based on result
-            if "win" in result.lower():
+            winner = move_result["info"].get("winner")
+            if result == "win":
                 # Game ended with a winner
-                if agent_role.lower() in result.lower():
+                if winner == agent_role:
                     # We won
                     reward = move_result["reward"]
                 else:
                     # Opponent won (we lost)
                     reward = -1.0
-            else:
+                    logger.info(f"[{request_id}] Opponent won ({winner}). Assigning reward -1.0")
+            elif result == "draw":
                 # Draw or other terminal state
+                reward = move_result["reward"]
+                if reward == 0.0:
+                    reward = -0.1
+                    logger.info(f"[{request_id}] Game ended in DRAW. Assigning default draw reward -0.1")
+            else:
                 reward = move_result["reward"]
             
             # Use next_observation if available, otherwise use observation
             final_observation = move_result.get("next_observation") or move_result["observation"]
-            logger.info(f"[{request_id}] Game ended. Result: {result}, Session: {session_id}")
+            logger.info(f"[{request_id}] Game ended. Result: {result}, Session: {session_id}, Final Reward: {reward}")
             return (
                 True,
                 f"Game Over - {result.upper()}\n{final_observation}",
@@ -413,6 +421,10 @@ class MultiAgentGomokuInteraction(BaseInteraction):
             )
         
         # Game continues - opponent should have moved (waited via wait_for_opponent=True)
+        # Intermediate step - game continues
+        if move_result["reward"] != 0.0:
+            logger.warning(f"[{request_id}] Received non-zero reward {move_result['reward']} for ongoing game!")
+
         opponent_move = move_result.get("opponent_move")
         next_observation = move_result.get("next_observation") or move_result["observation"]
 

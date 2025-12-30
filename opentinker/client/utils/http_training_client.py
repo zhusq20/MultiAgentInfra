@@ -612,6 +612,12 @@ class ServiceClient:
                     },
                     "rollout": {
                         "tensor_model_parallel_size": 2 if args.num_gpus > 1 else 1,
+                        # CRITICAL: Explicitly set prompt_length and response_length
+                        # These override the server defaults which may be too small for multi-turn games
+                        # Without this, OmegaConf interpolation ${oc.select:...} is already resolved
+                        # and data.max_response_length merge won't update response_length
+                        "prompt_length": args.max_prompt_tokens,
+                        "response_length": args.max_new_tokens,
                         # Pass rollout_n for GRPO (number of responses per sample)
                         "n": args.get("rollout_n", 1),
                         # Pass agent.num_workers to match batch size
@@ -949,6 +955,8 @@ class ServiceClient:
 
         for i, batch_dict in enumerate(val_dataloader):
             batch = DataProto.from_single_dict(batch_dict)
+            # Set validate=True so AgentLoop switches to RuleBasedGomokuInteraction
+            batch.meta_info["validate"] = True
             result = self.client.validate(batch)
 
             if result["status"] != "success":

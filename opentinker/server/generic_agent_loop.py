@@ -353,14 +353,53 @@ class GenericAgentLoop(AgentLoopBase):
                         "No interactions configured in interaction_config_file"
                     )
 
+
             interaction_name = interaction_kwargs["name"]
             if interaction_name not in self.interaction_map:
                 raise ValueError(
                     f"Interaction '{interaction_name}' not found. Available: {list(self.interaction_map.keys())}"
                 )
             
-            # Generate deterministic game_session_id for multi-agent interactions
-            # This ensures BLACK and WHITE agents join the same game session
+            # Check if this is a validation run
+            _validate = kwargs.get("validate", False)
+            
+            # For validation with multi_agent_gomoku or gomoku, switch to rule-based opponent
+            # This provides a consistent benchmark and doesn't require coordinating two LLM agents
+            if _validate and interaction_name in ("multi_agent_gomoku", "gomoku"):
+                # Check if rule_based_gomoku is available
+                if "rule_based_gomoku" in self.interaction_map:
+                    interaction_name = "rule_based_gomoku"
+                    interaction_kwargs["name"] = interaction_name
+                    logger.info(
+                        f"[VALIDATION] Switched to rule-based opponent for validation"
+                    )
+                else:
+                    # Create rule-based interaction on-the-fly if not in config
+                    from opentinker.environment.gomoku.rule_based_gomoku_interaction import (
+                        RuleBasedGomokuInteraction,
+                    )
+                    
+                    # Get config from the multi_agent interaction if possible
+                    multi_agent_interaction = self.interaction_map.get("multi_agent_gomoku")
+                    if multi_agent_interaction is None:
+                        multi_agent_interaction = self.interaction_map.get("gomoku")
+                    rule_based_config = {
+                        "board_size": getattr(multi_agent_interaction, "board_size", 9),
+                        "max_total_steps": getattr(multi_agent_interaction, "max_total_steps", 81),
+                        "max_invalid_moves": 3,
+                    }
+                    
+                    self.interaction_map["rule_based_gomoku"] = RuleBasedGomokuInteraction(
+                        config=rule_based_config
+                    )
+                    interaction_name = "rule_based_gomoku"
+                    interaction_kwargs["name"] = interaction_name
+                    logger.info(
+                        f"[VALIDATION] Created rule-based opponent: {rule_based_config}"
+                    )
+            
+            # Generate deterministic game_session_id for multi-agent interactions (training only)
+            # Rule-based validation doesn't need session IDs as it runs locally
             if interaction_name in ("multi_agent_gomoku", "gomoku"):
                 # Extract trajectory info from kwargs
                 _step = kwargs.get("step", 0)
@@ -369,25 +408,25 @@ class GenericAgentLoop(AgentLoopBase):
                 # For GRPO: sample_index identifies the original sample across all rollouts
                 _sample_index = kwargs.get("sample_index", 0)
                 _rollout_n = kwargs.get("rollout_n", 0)
-                _validate = kwargs.get("validate", False)
                 
                 # Create a deterministic session ID that will be the same for both BLACK and WHITE
                 # Format: {mode}_s{step}_i{sample_index}_r{rollout_n}
                 # Using sample_index directly ensures unique games per original sample
-                # Use different prefix for validation to avoid conflicts with training sessions
-                mode_prefix = "val" if _validate else "train"
+                mode_prefix = "train"  # Always train for multi_agent since validation uses rule-based
                 game_session_id = f"{mode_prefix}_s{_step}_i{_sample_index}_r{_rollout_n}"
                 interaction_kwargs["game_session_id"] = game_session_id
                 print(f"[GenericAgentLoop] Generated deterministic game_session_id: {game_session_id}")
             
             interaction = self.interaction_map[interaction_name]
             # Merge interaction_kwargs with full kwargs to ensure env_kwargs is available
-            combined_kwargs = {**kwargs, **interaction_kwargs}
+            # CRITICAL: DATA (kwargs) takes precedence over CONFIG (interaction_kwargs)
+            # This ensures that agent_role from the dataset is used instead of the default role
+            combined_kwargs = {**interaction_kwargs, **kwargs}
             await interaction.start_interaction(request_id, **combined_kwargs)
 
             # Capture initial board state ONLY for Gomoku environment (not other environments)
             initial_board_state = None
-            if interaction_name in ("multi_agent_gomoku", "gomoku"):
+            if interaction_name in ("multi_agent_gomoku", "gomoku", "rule_based_gomoku"):
                 if (
                     hasattr(interaction, "_instance_dict")
                     and request_id in interaction._instance_dict
@@ -773,6 +812,11 @@ class GenericAgentLoop(AgentLoopBase):
 
         # Check if adding these tokens would exceed response length
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            agent_data._termination_reason = "response_length_limit_interacting"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION in INTERACTING: response_length_limit. "
+                f"response_tokens={len(agent_data.response_mask)}, adding={len(response_ids)}, limit={self.response_length}"
+            )
             return GenericAgentState.TERMINATED
 
         # Update prompt_ids and response_mask

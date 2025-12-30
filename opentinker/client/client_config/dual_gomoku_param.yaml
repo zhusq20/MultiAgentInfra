@@ -37,7 +37,7 @@ val_batch_size: 100
 # Generation parameters
 temperature: 0.8
 top_p: 0.95
-max_new_tokens: 5120
+max_new_tokens: 12384
 max_prompt_tokens: 2048
 
 # Algorithm
@@ -68,7 +68,7 @@ interaction:
 multi_turn:
   max_user_turns: 40
   max_assistant_turns: 40
-  max_tokens_per_turn: 128
+  max_tokens_per_turn: 256
 
 # Scheduler settings
 scheduler_url: "http://0.0.0.0:8780"
