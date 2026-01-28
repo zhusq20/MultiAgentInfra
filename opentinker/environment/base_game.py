@@ -220,7 +220,7 @@ class GameDataGenerator:
         self,
         game_class: type,
         game_kwargs: Optional[Dict[str, Any]] = None,
-        seed: Optional[int] = None,
+        seed: Optional[int] = 42,
     ):
         """Initialize GameDataGenerator.
 

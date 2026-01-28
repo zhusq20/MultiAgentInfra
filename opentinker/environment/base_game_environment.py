@@ -124,16 +124,29 @@ class GameEnvironment(BaseEnvironment):
             self.job_id = job_id or config.get("job_id", "default")
 
         # Create interaction spec
+        # Use class_path from config if provided, otherwise default to GymEnvironmentInteraction
+        if hasattr(config, "interaction") and hasattr(config.interaction, "class_path"):
+            interaction_class_path = config.interaction.class_path
+            # Use the full interaction config for custom interaction classes
+            interaction_config_dict = OmegaConf.to_container(
+                config.interaction.config, resolve=True
+            ) if hasattr(config.interaction, "config") else {}
+            # Always inject job_id for statistics isolation
+            interaction_config_dict["job_id"] = self.job_id
+        else:
+            interaction_class_path = "opentinker.environment.gym_environment_interaction.GymEnvironmentInteraction"
+            interaction_config_dict = {
+                "env_endpoint": self.env_endpoint,
+                "max_steps": self.max_steps,
+                "observation_template": self.observation_template,
+                "job_id": self.job_id,
+            }
+        
         self.interaction_specs = [
             InteractionSpec(
                 name=self.interaction_name,
-                class_path="opentinker.environment.gym_environment_interaction.GymEnvironmentInteraction",
-                config={
-                    "env_endpoint": self.env_endpoint,
-                    "max_steps": self.max_steps,
-                    "observation_template": self.observation_template,
-                    "job_id": self.job_id,
-                },
+                class_path=interaction_class_path,
+                config=interaction_config_dict,
             )
         ]
 

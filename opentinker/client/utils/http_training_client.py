@@ -612,6 +612,18 @@ class ServiceClient:
                     },
                     "rollout": {
                         "tensor_model_parallel_size": 2 if args.num_gpus > 1 else 1,
+                        # CRITICAL: Explicitly set prompt_length and response_length
+                        # These override the server defaults which may be too small for multi-turn games
+                        # Without this, OmegaConf interpolation ${oc.select:...} is already resolved
+                        # and data.max_response_length merge won't update response_length
+                        "prompt_length": args.max_prompt_tokens,
+                        "response_length": args.max_new_tokens,
+                        # Pass rollout_n for GRPO (number of responses per sample)
+                        "n": args.get("rollout_n", 1),
+                        # Pass agent.num_workers to match batch size
+                        "agent": {
+                            "num_workers": args.get("num_workers", 8),
+                        },
                     },
                 },
                 "critic": {
@@ -661,6 +673,7 @@ class ServiceClient:
         verbose: bool = True,
         game_stats_client=None,
         game_stats_log_freq: int = 1,
+        phase_client=None,
     ):
         """
         Train the model.
@@ -677,6 +690,9 @@ class ServiceClient:
             game_stats_client: Optional GameStatsClient for fetching per-step game metrics
             game_stats_log_freq: How often to log game stats (in steps), only used if
                                 game_stats_client is provided
+            phase_client: Optional PhaseCoordinatorClient for multi-agent step sync.
+                         When provided, a barrier sync is performed before each train_step
+                         to ensure all agents start at the same step.
 
         Note:
             - If both num_steps and num_epochs are provided, num_steps takes precedence
@@ -729,6 +745,13 @@ class ServiceClient:
 
         # 4. Run validation before training if requested
         if validate_before_training and val_dataloader:
+            # Multi-agent sync: barrier before pre-training validation
+            if phase_client:
+                try:
+                    phase_client.sync_barrier("pre_training_validation")
+                except Exception as e:
+                    logger.warning(f"Failed to sync for pre-training validation: {e}")
+            
             logger.info("Running validation before training...")
             val_metrics = self._run_validation(val_dataloader, game_stats_client)
             logger.info(f"Pre-training validation: {val_metrics}")
@@ -748,6 +771,15 @@ class ServiceClient:
                     logger.info(f"Starting epoch {epoch + 1}/{effective_epochs}")
 
                 for batch_dict in train_dataloader:
+                    # Multi-agent sync: barrier before train_step to ensure both agents
+                    # start at the same step (critical for game_session_id matching)
+                    if phase_client:
+                        try:
+                            phase_client.sync_barrier(f"rollout_step_{steps_completed}")
+                            logger.debug(f"Synced at step {steps_completed}")
+                        except Exception as e:
+                            logger.warning(f"Failed to sync at step {steps_completed}: {e}")
+
                     # Reset game stats before each step (if game_stats_client provided)
                     if game_stats_client:
                         try:
@@ -768,6 +800,16 @@ class ServiceClient:
 
                     global_steps = result["global_steps"]
                     last_metrics = result["metrics"]
+
+                    # Multi-agent sync: barrier AFTER train_step to ensure both agents
+                    # finish current step before either proceeds to next step.
+                    # This prevents step count divergence when games end on WHITE's turn.
+                    if phase_client:
+                        try:
+                            phase_client.sync_barrier(f"step_complete_{steps_completed}")
+                            logger.debug(f"Step {steps_completed} completion synced")
+                        except Exception as e:
+                            logger.warning(f"Failed to sync step completion at step {steps_completed}: {e}")
 
                     # Fetch and log game stats (if game_stats_client provided)
                     if game_stats_client and global_steps % game_stats_log_freq == 0:
@@ -828,6 +870,14 @@ class ServiceClient:
                         and test_freq > 0
                         and global_steps % test_freq == 0
                     ):
+                        # Multi-agent sync: barrier before validation to ensure both
+                        # agents start validation at the same step
+                        if phase_client:
+                            try:
+                                phase_client.sync_barrier(f"validation_step_{global_steps}")
+                            except Exception as e:
+                                logger.warning(f"Failed to sync for validation at step {global_steps}: {e}")
+                        
                         val_metrics = self._run_validation(
                             val_dataloader, game_stats_client
                         )
@@ -905,6 +955,8 @@ class ServiceClient:
 
         for i, batch_dict in enumerate(val_dataloader):
             batch = DataProto.from_single_dict(batch_dict)
+            # Set validate=True so AgentLoop switches to RuleBasedGomokuInteraction
+            batch.meta_info["validate"] = True
             result = self.client.validate(batch)
 
             if result["status"] != "success":

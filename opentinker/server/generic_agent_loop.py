@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
+from opentinker.backend_patch.verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import (
     initialize_interactions_from_config,
@@ -353,17 +353,80 @@ class GenericAgentLoop(AgentLoopBase):
                         "No interactions configured in interaction_config_file"
                     )
 
+
             interaction_name = interaction_kwargs["name"]
             if interaction_name not in self.interaction_map:
                 raise ValueError(
                     f"Interaction '{interaction_name}' not found. Available: {list(self.interaction_map.keys())}"
                 )
+            
+            # Check if this is a validation run
+            _validate = kwargs.get("validate", False)
+            
+            # For validation with multi_agent_gomoku or gomoku, switch to rule-based opponent
+            # This provides a consistent benchmark and doesn't require coordinating two LLM agents
+            if _validate and interaction_name in ("multi_agent_gomoku", "gomoku"):
+                # Check if rule_based_gomoku is available
+                if "rule_based_gomoku" in self.interaction_map:
+                    interaction_name = "rule_based_gomoku"
+                    interaction_kwargs["name"] = interaction_name
+                    logger.info(
+                        f"[VALIDATION] Switched to rule-based opponent for validation"
+                    )
+                else:
+                    # Create rule-based interaction on-the-fly if not in config
+                    from opentinker.environment.gomoku.rule_based_gomoku_interaction import (
+                        RuleBasedGomokuInteraction,
+                    )
+                    
+                    # Get config from the multi_agent interaction if possible
+                    multi_agent_interaction = self.interaction_map.get("multi_agent_gomoku")
+                    if multi_agent_interaction is None:
+                        multi_agent_interaction = self.interaction_map.get("gomoku")
+                    rule_based_config = {
+                        "board_size": getattr(multi_agent_interaction, "board_size", 9),
+                        "max_total_steps": getattr(multi_agent_interaction, "max_total_steps", 81),
+                        "max_invalid_moves": 3,
+                    }
+                    
+                    self.interaction_map["rule_based_gomoku"] = RuleBasedGomokuInteraction(
+                        config=rule_based_config
+                    )
+                    interaction_name = "rule_based_gomoku"
+                    interaction_kwargs["name"] = interaction_name
+                    logger.info(
+                        f"[VALIDATION] Created rule-based opponent: {rule_based_config}"
+                    )
+            
+            # Generate deterministic game_session_id for multi-agent interactions (training only)
+            # Rule-based validation doesn't need session IDs as it runs locally
+            if interaction_name in ("multi_agent_gomoku", "gomoku"):
+                # Extract trajectory info from kwargs
+                _step = kwargs.get("step", 0)
+                # Use sample_index to compute the correct batch position
+                # sample_index is the dataloader index, synchronized between BLACK and WHITE agents
+                # For GRPO: sample_index identifies the original sample across all rollouts
+                _sample_index = kwargs.get("sample_index", 0)
+                _rollout_n = kwargs.get("rollout_n", 0)
+                
+                # Create a deterministic session ID that will be the same for both BLACK and WHITE
+                # Format: {mode}_s{step}_i{sample_index}_r{rollout_n}
+                # Using sample_index directly ensures unique games per original sample
+                mode_prefix = "train"  # Always train for multi_agent since validation uses rule-based
+                game_session_id = f"{mode_prefix}_s{_step}_i{_sample_index}_r{_rollout_n}"
+                interaction_kwargs["game_session_id"] = game_session_id
+                print(f"[GenericAgentLoop] Generated deterministic game_session_id: {game_session_id}")
+            
             interaction = self.interaction_map[interaction_name]
-            await interaction.start_interaction(request_id, **interaction_kwargs)
+            # Merge interaction_kwargs with full kwargs to ensure env_kwargs is available
+            # CRITICAL: DATA (kwargs) takes precedence over CONFIG (interaction_kwargs)
+            # This ensures that agent_role from the dataset is used instead of the default role
+            combined_kwargs = {**interaction_kwargs, **kwargs}
+            await interaction.start_interaction(request_id, **combined_kwargs)
 
             # Capture initial board state ONLY for Gomoku environment (not other environments)
             initial_board_state = None
-            if interaction_name == "gomoku":  # Only for Gomoku
+            if interaction_name in ("multi_agent_gomoku", "gomoku", "rule_based_gomoku"):
                 if (
                     hasattr(interaction, "_instance_dict")
                     and request_id in interaction._instance_dict
@@ -392,14 +455,56 @@ class GenericAgentLoop(AgentLoopBase):
         state = GenericAgentState.PENDING
         while state != GenericAgentState.TERMINATED:
             if state == GenericAgentState.PENDING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: PENDING")
                 state = await self._handle_pending_state(agent_data, sampling_params)
             elif state == GenericAgentState.GENERATING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: GENERATING (Calling LLM)")
                 state = await self._handle_generating_state(agent_data, sampling_params)
             elif state == GenericAgentState.INTERACTING:
+                print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] State: INTERACTING (Calling Environment)")
                 state = await self._handle_interacting_state(agent_data)
             else:
                 logger.error(f"Invalid state: {state}")
                 state = GenericAgentState.TERMINATED
+
+        # CRITICAL: Abort game if we terminated early (before game ended)
+        # This is needed when agent loop terminates due to:
+        # 1. response_length limit
+        # 2. max_user_turns / max_assistant_turns limit  
+        # 3. context overflow
+        # Without this, opponent would wait forever for our next move.
+        if interaction is not None and hasattr(interaction, '_instance_dict'):
+            instance = interaction._instance_dict.get(request_id)
+            if instance:
+                session_id = instance.get("session_id")
+                agent_id = instance.get("agent_id")
+                agent_role = instance.get("agent_role", "unknown")
+                # Check if game has properly ended via the game_ended flag
+                # This flag is set by the interaction when game terminates normally
+                game_ended = instance.get("game_ended", False)
+                
+                # Get termination reason for detailed logging (stored locally, not in extra_fields
+                # to avoid DataProto.concat key mismatch when some games end normally)
+                termination_reason = getattr(agent_data, '_termination_reason', 'unknown')
+                
+                if not game_ended and session_id and agent_id:
+                    logger.warning(
+                        f"[{request_id[:8]}] GAME ABORT: session={session_id}, agent={agent_role}, "
+                        f"reason={termination_reason}, user_turns={agent_data.user_turns}, "
+                        f"assistant_turns={agent_data.assistant_turns}, "
+                        f"response_tokens={len(agent_data.response_mask)}"
+                    )
+                    try:
+                        abort_reason = f"agent_loop_early_termination:{termination_reason}"
+                        await interaction._make_request(
+                            "POST",
+                            f"session/{session_id}/abort",
+                            params={"agent_id": agent_id, "reason": abort_reason},
+                            timeout=5.0,
+                        )
+                        logger.info(f"[{request_id[:8]}] Successfully aborted game {session_id}")
+                    except Exception as e:
+                        logger.warning(f"[{request_id[:8]}] Failed to abort game {session_id}: {e}")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -411,6 +516,9 @@ class GenericAgentLoop(AgentLoopBase):
         # Return 0.0 if no turn scores collected - this prevents fallback to naive reward loop
         # which expects ground_truth data that gym environments don't provide
         final_reward = sum(agent_data.turn_scores) if agent_data.turn_scores else 0.0
+        
+        # DEBUG: Log turn_scores and final_reward for diagnosis
+        print(f"[GenericAgentLoop DEBUG] [{request_id[:8]}] REWARD: turn_scores={agent_data.turn_scores}, final_reward={final_reward}, user_turns={agent_data.user_turns}")
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -561,18 +669,40 @@ class GenericAgentLoop(AgentLoopBase):
         if response_log_probs:
             agent_data.response_logprobs += response_log_probs
 
-        # Check termination conditions
+        # Check termination conditions with detailed logging
+        # NOTE: Store termination_reason as instance attribute (not in extra_fields)
+        # to avoid DataProto.concat key mismatch when some games end normally
         if len(agent_data.response_mask) >= self.response_length:
+            agent_data._termination_reason = "response_length_limit"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
+                f"response_tokens={len(agent_data.response_mask)}, limit={self.response_length}, "
+                f"user_turns={agent_data.user_turns}, assistant_turns={agent_data.assistant_turns}"
+            )
             return GenericAgentState.TERMINATED
+        
         # Use > instead of >= so that max_assistant_turns=1 allows 1 generation + 1 step
         # before terminating (instead of terminating immediately after first generation)
         if (
             self.max_assistant_turns
             and agent_data.assistant_turns > self.max_assistant_turns
         ):
+            agent_data._termination_reason = "max_assistant_turns_exceeded"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
+                f"assistant_turns={agent_data.assistant_turns}, limit={self.max_assistant_turns}, "
+                f"user_turns={agent_data.user_turns}, response_tokens={len(agent_data.response_mask)}"
+            )
             return GenericAgentState.TERMINATED
+        
         # Similarly, max_user_turns=1 means user can ask once, then terminate after next generation
         if self.max_user_turns and agent_data.user_turns > self.max_user_turns:
+            agent_data._termination_reason = "max_user_turns_exceeded"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION: {agent_data._termination_reason}. "
+                f"user_turns={agent_data.user_turns}, limit={self.max_user_turns}, "
+                f"assistant_turns={agent_data.assistant_turns}, response_tokens={len(agent_data.response_mask)}"
+            )
             return GenericAgentState.TERMINATED
 
         # Add assistant message to conversation history
@@ -608,7 +738,31 @@ class GenericAgentLoop(AgentLoopBase):
         ) = await agent_data.interaction.generate_response(
             agent_data.request_id, agent_data.messages, **agent_data.interaction_kwargs
         )
-        agent_data.user_turns += 1
+
+        # Check if we should skip adding the assistant message to history
+        # This is used for retry scenarios where the failed attempt should not be recorded
+        skip_assistant_message = info.get("skip_assistant_message", False) if info else False
+
+        if skip_assistant_message:
+            # Remove the last assistant message from conversation history
+            # (it was added in _handle_generated_state before calling interaction)
+            if agent_data.messages and agent_data.messages[-1]["role"] == "assistant":
+                agent_data.messages.pop()
+
+            # Mark the failed response tokens with mask=0 so they don't contribute to loss
+            # Find where the assistant response tokens start (they were just added)
+            num_response_tokens = len(agent_data.response_ids)
+            if num_response_tokens > 0:
+                # Set mask to 0 for these tokens (exclude from loss)
+                start_idx = len(agent_data.response_mask) - num_response_tokens
+                for i in range(start_idx, len(agent_data.response_mask)):
+                    agent_data.response_mask[i] = 0
+
+            # Don't increment user_turns for retry attempts
+            # This prevents hitting max_user_turns limit due to retries
+        else:
+            # Only increment user_turns for successful interactions
+            agent_data.user_turns += 1
 
         # Record turn-level reward (will be summed for final reward)
         if reward is not None:
@@ -617,7 +771,8 @@ class GenericAgentLoop(AgentLoopBase):
         # Store environment info under a SINGLE key to ensure consistent structure
         # across all samples (avoids DataProto.concat assertion errors when different
         # samples return different info keys)
-        if info:
+        # Don't store env_info for retry attempts (skip_assistant_message=True)
+        if info and not skip_assistant_message:
             # Append to list instead of overwriting (for multi-turn)
             if "env_info" not in agent_data.extra_fields:
                 agent_data.extra_fields["env_info"] = []
@@ -625,7 +780,11 @@ class GenericAgentLoop(AgentLoopBase):
 
         # Construct user message from observation
         add_messages: list[dict[str, Any]] = [{"role": "user", "content": observation}]
-        agent_data.messages.extend(add_messages)
+
+        # Only add to messages if NOT a retry attempt
+        # Retry attempts: observation goes to prompt_ids (for LLM context) but NOT to messages (for recording)
+        if not skip_assistant_message:
+            agent_data.messages.extend(add_messages)
 
         # Tokenize the user message (environment observation)
         if self.processor is not None:
@@ -653,6 +812,11 @@ class GenericAgentLoop(AgentLoopBase):
 
         # Check if adding these tokens would exceed response length
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            agent_data._termination_reason = "response_length_limit_interacting"
+            logger.warning(
+                f"[{agent_data.request_id[:8]}] EARLY TERMINATION in INTERACTING: response_length_limit. "
+                f"response_tokens={len(agent_data.response_mask)}, adding={len(response_ids)}, limit={self.response_length}"
+            )
             return GenericAgentState.TERMINATED
 
         # Update prompt_ids and response_mask

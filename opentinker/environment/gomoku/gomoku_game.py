@@ -66,6 +66,7 @@ class GomokuGame(AbstractGame):
         max_total_steps: Optional[int] = None,
         max_initial_moves: Optional[int] = None,
         empty_board_prob: Optional[float] = None,
+        agent_role: Optional[str] = None,
     ):
         """Initialize Gomoku game.
 
@@ -75,6 +76,8 @@ class GomokuGame(AbstractGame):
             max_total_steps: Maximum steps before timeout
             max_initial_moves: Maximum initial moves to place before game starts
             empty_board_prob: Probability of starting with an empty board
+            agent_role: For multi-agent mode: "BLACK" (X, first) or "WHITE" (O, second).
+                       If None, uses single-agent mode where LLM always plays as X.
         """
         self.board_size = board_size
         self.win_length = min(win_length, board_size)
@@ -88,6 +91,18 @@ class GomokuGame(AbstractGame):
         self.empty_board_prob = (
             empty_board_prob if empty_board_prob is not None else self.EMPTY_BOARD_PROB
         )
+        # Multi-agent mode: agent_role determines the player's role
+        # None means single-agent mode (LLM plays as X against AI)
+        self.agent_role = agent_role.upper() if agent_role else None
+        
+        # Determine symbols based on role
+        if self.agent_role == "WHITE":
+            self.llm_symbol = self.PLAYER_O
+            self.env_symbol = self.PLAYER_X
+        else:
+            self.llm_symbol = self.PLAYER_X
+            self.env_symbol = self.PLAYER_O
+            
         self._init_game_state()
 
     def _init_game_state(self):
@@ -170,20 +185,20 @@ class GomokuGame(AbstractGame):
         self.consecutive_invalid_moves = 0
 
         # Make the move
-        self.board[row][col] = self.PLAYER_X
+        self.board[row][col] = self.llm_symbol
         self.move_count += 1
         self.last_move = (row, col)
 
         # Check for win
-        if self._check_win(row, col, self.PLAYER_X):
+        if self._check_win(row, col, self.llm_symbol):
             self.game_over = True
-            self.winner = self.PLAYER_X
+            self.winner = self.llm_symbol
             return StepResult(
                 observation=f"Congratulations! You win!\n\n{self._render_board()}",
                 reward=self.REWARD_WIN,
                 done=True,
                 info={
-                    "winner": "X",
+                    "winner": self.llm_symbol,
                     "move": [row, col],
                     "board_state": self.get_state(),
                 },
@@ -201,18 +216,18 @@ class GomokuGame(AbstractGame):
 
         # Environment's turn
         env_row, env_col = self._make_env_move()
-        self.board[env_row][env_col] = self.PLAYER_O
+        self.board[env_row][env_col] = self.env_symbol
         self.move_count += 1
 
         # Check if environment wins
-        if self._check_win(env_row, env_col, self.PLAYER_O):
+        if self._check_win(env_row, env_col, self.env_symbol):
             self.game_over = True
-            self.winner = self.PLAYER_O
+            self.winner = self.env_symbol
             return StepResult(
-                observation=f"You lose! Opponent placed O at ({env_row},{env_col}).\n\n{self._render_board()}",
+                observation=f"You lose! Opponent placed {self.env_symbol} at ({env_row},{env_col}).\n\n{self._render_board()}",
                 reward=self.REWARD_LOSS,
                 done=True,
-                info={"winner": "O", "env_move": [env_row, env_col]},
+                info={"winner": self.env_symbol, "env_move": [env_row, env_col]},
             )
 
         # Check for draw after environment move
@@ -227,9 +242,9 @@ class GomokuGame(AbstractGame):
 
         # Game continues
         observation = (
-            f"Opponent placed O at ({env_row},{env_col}).\n\n"
+            f"Opponent placed {self.env_symbol} at ({env_row},{env_col}).\n\n"
             f"{self._render_board()}\n\n"
-            f"Your turn (X). Analyze and provide your move:\n"
+            f"Your turn ({self.llm_symbol}). Analyze and provide your move:\n"
             f"<thinking>your analysis</thinking>\n"
             f"<move>row,col</move>"
         )
@@ -244,9 +259,25 @@ class GomokuGame(AbstractGame):
     def get_system_prompt(self) -> str:
         """Return the system prompt for Gomoku."""
         center = self.board_size // 2
+        
+        # Multi-agent mode: role-aware prompts
+        if self.agent_role == "BLACK":
+            symbol = "X"
+            role_info = "You play first."
+        elif self.agent_role == "WHITE":
+            symbol = "O"
+            role_info = "You play second (after opponent's first move)."
+        else:
+            # Single-agent mode: LLM always plays as X
+            symbol = "X"
+            role_info = ""
+        
+        role_line = f"You play as {self.agent_role} ({symbol}). {role_info}\n" if self.agent_role else f"You play as {symbol}.\n"
+        
         return (
             f"You are playing Gomoku (Five in a Row) on a {self.board_size}x{self.board_size} board.\n"
-            f"You play as X. Your goal is to get {self.win_length} in a row.\n\n"
+            f"{role_line}"
+            f"Your goal is to get {self.win_length} in a row.\n\n"
             f"IMPORTANT: You MUST respond in the following format:\n"
             f"1. First, analyze the board in <thinking></thinking> tags\n"
             f"2. Then, output your move in <move>row,col</move> tags\n\n"
@@ -255,11 +286,26 @@ class GomokuGame(AbstractGame):
 
     def get_initial_user_message(self) -> str:
         """Return the initial user message for Gomoku."""
-        return (
-            f"Game starts. Here's the board:\n\n"
-            f"{self._render_board()}\n\n"
-            f"Your turn (X). Provide your thinking and move:"
-        )
+        # Multi-agent mode: role-aware initial message
+        if self.agent_role == "BLACK":
+            return (
+                f"Game starts. Here's the empty board:\n\n"
+                f"{self._render_board()}\n\n"
+                f"You play first (X). Analyze and provide your move:"
+            )
+        elif self.agent_role == "WHITE":
+            return (
+                f"Game started. Waiting for opponent's first move.\n\n"
+                f"{self._render_board()}\n\n"
+                f"After opponent moves, provide your thinking and move:"
+            )
+        else:
+            # Single-agent mode
+            return (
+                f"Game starts. Here's the board:\n\n"
+                f"{self._render_board()}\n\n"
+                f"Your turn (X). Provide your thinking and move:"
+            )
 
     def get_state(self) -> Dict[str, Any]:
         """Return current game state."""
@@ -371,10 +417,11 @@ class GomokuGame(AbstractGame):
         self.board = saved_board
         self.move_count = saved_count
 
+        symbol = "X" if self.agent_role != "WHITE" else "O"
         if initial_moves:
-            return f"Current board state:\n\n{board_str}\n\nYour turn (X). Analyze and provide your move:"
+            return f"Current board state:\n\n{board_str}\n\nYour turn ({symbol}). Analyze and provide your move:"
         else:
-            return f"Game starts. Here's the empty board:\n\n{board_str}\n\nYou play first (X). Analyze and provide your move:"
+            return f"Game starts. Here's the empty board:\n\n{board_str}\n\nYou play first ({symbol}). Analyze and provide your move:"
 
     def get_interaction_name(self) -> str:
         """Return interaction name for Gomoku."""
@@ -531,16 +578,16 @@ class GomokuGame(AbstractGame):
 
         # Check for winning move
         for r, c in empty_cells:
-            self.board[r][c] = self.PLAYER_O
-            if self._check_win(r, c, self.PLAYER_O):
+            self.board[r][c] = self.env_symbol
+            if self._check_win(r, c, self.env_symbol):
                 self.board[r][c] = self.EMPTY
                 return r, c
             self.board[r][c] = self.EMPTY
 
         # Block opponent's winning move
         for r, c in empty_cells:
-            self.board[r][c] = self.PLAYER_X
-            if self._check_win(r, c, self.PLAYER_X):
+            self.board[r][c] = self.llm_symbol
+            if self._check_win(r, c, self.llm_symbol):
                 self.board[r][c] = self.EMPTY
                 return r, c
             self.board[r][c] = self.EMPTY
@@ -551,8 +598,8 @@ class GomokuGame(AbstractGame):
         for r, c in empty_cells:
             score = 0
             for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
-                count = self._count_in_direction(r, c, dr, dc, self.PLAYER_O)
-                count += self._count_in_direction(r, c, -dr, -dc, self.PLAYER_O)
+                count = self._count_in_direction(r, c, dr, dc, self.env_symbol)
+                count += self._count_in_direction(r, c, -dr, -dc, self.env_symbol)
                 score += count
 
             # Center preference
